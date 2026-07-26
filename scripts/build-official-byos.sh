@@ -101,6 +101,11 @@ if [[ "$FP64" == "1" ]]; then
   CONF_ARGS+=(--enable-qhash-byos-fp64)
 fi
 
+# The CUDA scanhash glue is ours, not upstream's: keep the copy in this repo
+# authoritative and install it into official-miner before configuring.
+install -D -m 644 "$ROOT/src/byos/qhash_scanhash_cuda.cpp" \
+  "$OFFICIAL/algo/qhash/qhash-scanhash-cuda.cpp"
+
 echo "==> autotools official-miner"
 cd "$OFFICIAL"
 # Ensure automake aux files exist (config.guess/sub from autotools-dev).

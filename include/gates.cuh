@@ -54,6 +54,25 @@ QHASH_HD float qsin(float x)
 #endif
 }
 
+/**
+ * Fused multiply-add, a*b+c with a single rounding.
+ *
+ * Unlike compiler-contracted a*b+c (which we keep disabled via -ffp-contract=off
+ * and --fmad=false because the two compilers fuse different subexpressions), an
+ * explicit IEEE-754 fma has exactly one correctly-rounded result. glibc's fma and
+ * the device's __fma_rn therefore return identical bits, so the closed-form sweep
+ * stays byte-for-byte comparable between CPU and GPU while issuing half as many
+ * FP64 instructions.
+ */
+QHASH_HD double qfma(double a, double b, double c)
+{
+#ifdef __CUDA_ARCH__
+    return __fma_rn(a, b, c);
+#else
+    return ::fma(a, b, c);
+#endif
+}
+
 template <typename Real>
 struct Complex {
     Real re, im;

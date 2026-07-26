@@ -9,26 +9,52 @@ Drops into the [official miner](https://github.com/super-quantum/qubitcoin-miner
 
 ## Why this exists
 
-The stock miner launches **cuStateVec once per gate** (FP32). We replace that with a **monolithic FP64 CUDA kernel** (fused gates, shared-memory tiling, fused ⟨Z⟩ + SHA-256) that matches consensus bit-exactness.
+The stock miner simulates the 16-qubit circuit by pushing **65536 amplitudes** through cuStateVec, one
+launch per gate, in FP32. We don't simulate the circuit at all.
+
+All 16 ⟨Z⟩ values follow **exactly** from a 16-step sweep over a single 2×2 matrix — **32 bytes** of
+state per nonce instead of 1 MiB, one *thread* per nonce instead of one *block*, no shared memory and
+no barriers. This is an algebraic identity, not an approximation: the trailing CNOT staircase maps
+`Z_q → Z_0…Z_q`, and the leading staircase on a product state has a closed-form prefix-XOR
+(bond-dimension-2) description. See `PLAN.md` → *Phase 6 notes* for the derivation.
 
 | | Official (cuStateVec) | This project (BYOS CUDA) |
 |--|----------------------|---------------------------|
 | Precision | FP32 | **FP64** (consensus) |
-| Same-card rate (RTX 5060 Laptop) | **~0.76 kh/s** | **~3.1–3.3 kh/s** |
-| Speedup | 1× | **~4×** |
+| Method | 65536-amplitude statevector | **closed-form ⟨Z⟩ sweep** (4 doubles) |
+| Same-card rate (RTX 5060 **Laptop**) | **~0.76 kh/s** | **~298 000 kh/s** (~298 Mh/s) |
+| Speedup | 1× | **~390×** |
 | Gate convention | cuStateVec `exp(+i θ P)` | same (verified) |
 
-Literature baselines (other GPUs): official ~4.5 kh/s on RTX 4070; community AllFather ~20 kh/s. Our current plateau on a 5060 Laptop is **~3 kh/s** — still a large win vs stock on the *same* card; further gains need Nsight Compute (GPU counters) or larger algorithmic changes.
+That is ~**88 000×** our own previous FP64 statevector kernel (~3.25 kh/s), and it puts the kernel at
+**96% of this card's measured FP64 instruction-issue rate** — the arithmetic is now the wall, so
+there is little left to win without changing precision, which correctness forbids (below).
+
+Literature baselines (other GPUs): official ~4.5 kh/s on RTX 4070; community AllFather ~20 kh/s.
+
+### Correctness
+
+The statevector did not go away — it is the **consensus oracle**:
+
+- Closed form vs FP64 statevector: **0 real divergences** over 4 M nonces / 64 M Q1.15 values, and
+  it is **7.5× closer to cuStateVec** than our own statevector was.
+- A handful of nonces (~1 in 10⁵) land on an **exact** Q1.15 rounding boundary where no FP64
+  evaluation order has a defined answer, including the node's. Every candidate that passes target is
+  therefore **re-simulated with the statevector**, and the oracle's digest is the one submitted — so
+  the closed form can never decide a share.
+- FP32 mining stays **disabled**: digest match vs FP64 was only ~92% over 1.5 M nonces. Float-float
+  FP32 was also measured and **rejected** — the Q1.15 safety margin is only ~20× the FP64 residual,
+  and float-float is ~128× less accurate.
 
 ### Profitability (rough)
 
 Pool payout scales with **accepted shares ≈ hashrate × time** (same pool/diff).
 
-- **Revenue:** ~**4×** vs stock cuStateVec on the same GPU (measured hashrate ratio).
-- **Power:** FP64 usually draws more than FP32; net **profit** uplift is typically a bit under the hashrate ratio (measure with `nvidia-smi` on your rig).
-- **Correctness:** FP32 mining is **disabled** here — digest match vs FP64 was only ~92% over 1.5M nonces (need ≥99.99% for safe mining).
-
-At Suprnova Diff **0.5** and ~3 kh/s, expect **~8–9 days** between shares. Hash validation was already proven (11/11 submits → only `low difficulty share` rejects via a low-diff proxy; 0 invalid).
+- **Revenue:** ~**390×** vs stock cuStateVec on the same GPU (measured hashrate ratio).
+- **Power:** unchanged board power for ~390× the work, so efficiency scales with the ratio.
+- At Suprnova Diff **0.5**, the old ~8–9 day wait between shares becomes **sub-second**. Hash
+  validation was already proven at 3 kh/s (11/11 submits → only `low difficulty share` rejects via a
+  low-diff proxy; 0 invalid); credited accepts at this rate are Phase 7.
 
 ---
 
@@ -115,16 +141,20 @@ CPU-only fallback (no GPU / no toolkit): builds without CUDA; much slower.
 
 ```
 qhash-miner/
-├── include/           # circuit, gates, sha256, params
+├── include/
+│   ├── closed_form.cuh      # the shipped ⟨Z⟩ sweep (host + device)
+│   ├── sha256_mine.cuh      # midstate + constant-folded schedules
+│   └── circuit, gates, sha256, params
 ├── src/
-│   ├── qhash_kernel.cu      # monolithic CUDA miner
-│   ├── qhash_cpu.cpp        # FP64 reference
-│   └── byos/qhash_byos.cpp  # official-miner drop-in
+│   ├── qhash_kernel.cu      # closed-form miner + statevector oracle
+│   ├── qhash_cpu.cpp        # CPU reference, either simulator
+│   └── byos/                # official-miner drop-in (ABI) + CUDA scanhash
+├── bench/cf_ablation.cu     # cost split + FP64 roofline probe
 ├── scripts/
 │   ├── build-official-byos.sh
 │   ├── mine-suprnova.sh     # default pool helper
 │   └── pool-accept-check.sh
-├── tests/
+├── tests/                   # closed_form_check (the Phase 6 gate), golden, ABI
 ├── PLAN.md            # detailed progress / benchmarks
 └── AGENTS.md          # toolchain notes for agents
 ```
@@ -133,18 +163,33 @@ qhash-miner/
 
 ## Correctness
 
-- Self-test + `ctest` / `qhash-test`  
-- vs cuStateVec FP64 Q1.15: **1024/1024** bit-exact after gate-convention fix  
-- GPU vs CPU FP64 digests: bit-exact on spot checks  
-- **FP32 mining OFF** (~92% digest match — unsafe)
+- Self-test + `ctest` (6/6: ABI, circuit, self-test, closed form, soft-forks, cuStateVec golden)
+- vs cuStateVec FP64 Q1.15: **1024/1024** bit-exact after the gate-convention fix; the closed form
+  re-validated on 20 000 random + 4096 uniform nibble patterns
+- Closed form vs FP64 statevector: **0 real divergences** / 64 M Q1.15 values over 4 M nonces
+- Closed-form CUDA kernel vs CPU: **bit-exact on 16 M nonces**
+- Adversarial coverage: all 8192 uniform nibble patterns, including **1152** exact ±1 values and
+  **732** deliberate `+32768 → −32768` int16 wraps, plus an importance-sampled rounding-boundary scan
+- Every share re-verified through the statevector oracle before submission
+- **FP32 mining OFF** (~92% digest match — unsafe); float-float FP32 measured and rejected
+
+Run the gate with `./build/qhash-closed-form-check --mode all --nonces 4000000`; arbitrate a single
+nonce with `--mode nonce --nonce N --offset 0|1`.
 
 ---
 
 ## Status / limits
 
-- Kernel plateau ~**2.7–3.3 kh/s** on RTX 5060 Laptop (tile 2048, T=256, C=128).  
-- Nsight Compute needs Windows **GPU performance counters** enabled (WSL: NVIDIA App / Control Panel → Developer → allow counters).  
-- Multi-GPU and further kernel work tracked in `PLAN.md`.
+- **~287 Mh/s sustained**, ~298 Mh/s end-to-end through official-miner, on an RTX 5060 **Laptop**.
+- The kernel is **FP64-instruction-bound at 96%** of the card's measured issue rate (379 FP64
+  instructions per nonce). Occupancy, SHA-256 (12% of time, fully hidden) and memory are all
+  irrelevant now — geometry is flat within 1% over threads 128–512 and 1–16 resident waves.
+- Measure with a **multi-second** load: a cold single launch reads ~26 Mh/s purely because the GPU has
+  not boosted yet.
+- Nsight Compute still needs Windows **GPU performance counters** enabled (WSL: NVIDIA App / Control
+  Panel → Developer → allow counters); the cost split above was obtained by ablation
+  (`qhash-cf-ablation`) instead.
+- Credited pool shares at this rate, long-run stability, and multi-GPU are tracked in `PLAN.md`.
 
 ---
 

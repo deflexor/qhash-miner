@@ -1,23 +1,30 @@
 /**
- * Monolithic fused qhash CUDA kernel (Phase 1–3b+).
+ * qhash CUDA kernels.
  *
- * Launch geometry: gridDim.x = number of nonces, blockDim.x = 128 or 256.
- * Each block owns one state vector in global memory (L2-resident working set).
- * Ry+Rz fused into one 2×2 per qubit/layer; high U2 fibers first (U2s commute),
- * then low U2+CNOT fused in one tile residency; optional dual-tile so boundary
- * CNOT(kTileQ-1,kTileQ) stays in smem; high CNOT fibers; ⟨Z⟩ + SHA256 inline.
- * Optional multi-stream; optional 2× tile dbuf (usually off).
+ * qhash_cf_kernel (Phase 6) is the mining path: the closed-form ⟨Z⟩ sweep, one
+ * nonce per thread, no state buffer and no per-nonce barrier. Everything a nonce
+ * needs lives in registers plus a small angle table in shared memory.
+ *
+ * qhash_mine_kernel is the original 65536-amplitude statevector, one block per
+ * nonce, kept as the consensus oracle: the self-test, the cuStateVec golden
+ * harness and candidate re-verification all run through it. It is no longer
+ * performance-relevant, so Phase 6.13 stripped the tiling, fiber-blocking,
+ * double-buffering and boundary-pairing variants that used to surround it.
  *
  * When compiled without CUDA (QHASH_CPU_ONLY), falls back to the CPU simulator.
  */
 #include "qhash_kernel.cuh"
 #include "circuit.cuh"
+#include "closed_form.cuh"
 #include "sha256.cuh"
+#include "sha256_mine.cuh"
 #include "qhash_cpu.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 using namespace qhash;
@@ -168,361 +175,20 @@ __device__ void d_apply_cnot(Complex<Real>* psi, int control, int target, int ti
     d_apply_cnot_n(psi, control, target, tid, nthreads, QHASH_STATE_SIZE);
 }
 
-/*
- * Shared-memory tile: default 2048 amps = 2^11 → gates on qubits 0..10 stay
- * inside a tile (FP64 ≈ 32 KiB + gate cache). Single-qubit U2s in a layer
- * commute, so low-qubit gates may run in the tile before high-qubit global U2s.
- *
- * Tile 4096 (qubits 0..11) needs dynamic smem for FP64 (65 KiB > 48 KiB static);
- * enable with -DQHASH_SMEM_TILE=4096 (host opts in via cudaFuncSetAttribute).
- * Override with -DQHASH_SMEM_TILE=0 to disable (CNOT pair-index tiling remains).
- *
- * Note: even/odd CNOT brickwork is NOT consensus-safe here — NN CNOTs in a
- * chain do not commute; must stay sequential for bit-exact digests.
- */
-#ifndef QHASH_SMEM_TILE
-#define QHASH_SMEM_TILE 2048
-#endif
-#ifndef QHASH_SMEM_TILE_Q
-#if QHASH_SMEM_TILE <= 0
-#define QHASH_SMEM_TILE_Q 0
-#elif QHASH_SMEM_TILE == 4096
-#define QHASH_SMEM_TILE_Q 12
-#elif QHASH_SMEM_TILE == 2048
-#define QHASH_SMEM_TILE_Q 11
-#elif QHASH_SMEM_TILE == 1024
-#define QHASH_SMEM_TILE_Q 10
-#else
-#error "Set QHASH_SMEM_TILE to 0, 1024, 2048, or 4096 (and matching QHASH_SMEM_TILE_Q)"
-#endif
-#endif
-
-/*
- * Optional 2× tile double-buffer (scatter N ∥ gather N+1). Measured slower on
- * RTX 5060 Laptop (extra dyn smem / pointer ping-pong) — leave OFF.
- * Fiber-blocked high qubits (gather→gates→scatter) stay ON and help.
- *
- * QHASH_BOUNDARY_PAIR=1: low section uses 2×tile smem so CNOT(kTileQ-1,kTileQ)
- * stays in shared memory (no full-state global boundary pass). Pays dyn smem.
- */
-#ifndef QHASH_TILE_DBUF
-#define QHASH_TILE_DBUF 0
-#endif
-#ifndef QHASH_BOUNDARY_PAIR
-#define QHASH_BOUNDARY_PAIR 0
-#endif
-#if QHASH_TILE_DBUF && (QHASH_SMEM_TILE > 0) && (QHASH_SMEM_TILE * 16 * 2 <= 96 * 1024)
-#define QHASH_DYN_TILES 2
-#elif QHASH_BOUNDARY_PAIR && (QHASH_SMEM_TILE > 0) && (QHASH_SMEM_TILE * 16 * 2 <= 96 * 1024)
-#define QHASH_DYN_TILES 2
-#else
-#define QHASH_DYN_TILES 1
-#endif
-#if (QHASH_SMEM_TILE * 16 > 48 * 1024) || (QHASH_DYN_TILES > 1)
-#define QHASH_SMEM_DYNAMIC 1
-#else
-#define QHASH_SMEM_DYNAMIC 0
-#endif
-
 /**
- * High-qubit fiber block (Phase 3b+): qubits [kTileQ .. 15] are the high bits
- * above a contiguous smem tile. For fixed low index L (0..2^kTileQ-1), the
- * 2^(16-kTileQ) amplitudes {psi[L + j<<kTileQ]} form a fiber closed under all
- * gates on those high qubits. Gather fibers into the tile, apply every high
- * U2/CNOT in smem, scatter once — vs one full-state global pass per gate.
+ * The circuit, one gate at a time, straight over the state in global memory.
  *
- * Tile layout while fiber-blocked: tile[f * kFiber + j] holds fiber
- * (fiber_base + f), amplitude j. Bit-exact: fibers commute; within a fiber
- * gate order matches the sequential global path.
- *
- * Gather/scatter stream consecutive fibers at fixed j for coalesced global IO.
+ * This kernel is now only the consensus oracle: the Phase-6 closed form took over
+ * mining, so the shared-memory tiling, high-qubit fiber blocking, tile
+ * double-buffering and boundary pairing that Phases 2-3b grew around it were
+ * retired in 6.13 along with their build options. What is left applies the gates
+ * in exactly the order circuit.cuh documents, which is the version worth trusting
+ * and the one the CPU reference matches gate for gate.
  */
-template <typename Real>
-__device__ void d_fiber_gather(Complex<Real>* tile, const Complex<Real>* psi, int fiber_base,
-                               int n_fibers, int fiber_len, int low_bits, int tid, int nthreads)
-{
-    const int n = n_fibers * fiber_len;
-    for (int i = tid; i < n; i += nthreads) {
-        const int j = i / n_fibers;
-        const int f = i - j * n_fibers;
-        tile[f * fiber_len + j] = psi[(fiber_base + f) | (j << low_bits)];
-    }
-    __syncthreads();
-}
-
-template <typename Real>
-__device__ void d_fiber_scatter(Complex<Real>* psi, const Complex<Real>* tile, int fiber_base,
-                                int n_fibers, int fiber_len, int low_bits, int tid, int nthreads)
-{
-    const int n = n_fibers * fiber_len;
-    for (int i = tid; i < n; i += nthreads) {
-        const int j = i / n_fibers;
-        const int f = i - j * n_fibers;
-        psi[(fiber_base + f) | (j << low_bits)] = tile[f * fiber_len + j];
-    }
-    __syncthreads();
-}
-
-/** Scatter tile_a[fiber_base] and optionally gather tile_b[next_base] in one pass. */
-template <typename Real>
-__device__ void d_fiber_scatter_gather(Complex<Real>* psi, const Complex<Real>* tile_out,
-                                       Complex<Real>* tile_in, int fiber_base, int next_base,
-                                       int do_gather, int n_fibers, int fiber_len, int low_bits,
-                                       int tid, int nthreads)
-{
-    const int n = n_fibers * fiber_len;
-    for (int i = tid; i < n; i += nthreads) {
-        const int j = i / n_fibers;
-        const int f = i - j * n_fibers;
-        psi[(fiber_base + f) | (j << low_bits)] = tile_out[f * fiber_len + j];
-        if (do_gather)
-            tile_in[f * fiber_len + j] = psi[(next_base + f) | (j << low_bits)];
-    }
-    __syncthreads();
-}
-
-/** U2 on relative qubit rq inside each packed fiber (n_fibers × fiber_len). */
-template <typename Real>
-__device__ void d_fiber_u2(Complex<Real>* tile, int rq, const U2<Real>& u, int n_fibers,
-                           int fiber_len, int tid, int nthreads)
-{
-    const int npairs_fiber = fiber_len >> 1;
-    const int total = n_fibers * npairs_fiber;
-    const int mask = 1 << rq;
-    for (int p = tid; p < total; p += nthreads) {
-        const int f = p / npairs_fiber;
-        const int pf = p - f * npairs_fiber;
-        const int lo = pf & ((1 << rq) - 1);
-        const int hi = pf >> rq;
-        const int i = (f * fiber_len) + (lo | (hi << (rq + 1)));
-        const int j = i | mask;
-        Complex<Real> a = tile[i];
-        Complex<Real> b = tile[j];
-        apply_u2_pair(a, b, u);
-        tile[i] = a;
-        tile[j] = b;
-    }
-    __syncthreads();
-}
-
-/** CNOT on relative (rc → rt) inside each packed fiber. */
-template <typename Real>
-__device__ void d_fiber_cnot(Complex<Real>* tile, int rc, int rt, int n_fibers, int fiber_len,
-                             int tid, int nthreads)
-{
-    const int npairs_fiber = fiber_len >> 2;
-    const int total = n_fibers * npairs_fiber;
-    const int cmask = 1 << rc;
-    const int tmask = 1 << rt;
-    const int q0 = rc < rt ? rc : rt;
-    const int q1 = rc < rt ? rt : rc;
-    const int lo_bits = q0;
-    const int mid_bits = q1 - q0 - 1;
-    const int lo_mask = (1 << lo_bits) - 1;
-    const int mid_mask = (1 << mid_bits) - 1;
-
-    for (int p = tid; p < total; p += nthreads) {
-        const int f = p / npairs_fiber;
-        const int pf = p - f * npairs_fiber;
-        const int lo = pf & lo_mask;
-        const int mid = (pf >> lo_bits) & mid_mask;
-        const int hi = pf >> (lo_bits + mid_bits);
-        const int base = (f * fiber_len) + (lo | (mid << (q0 + 1)) | (hi << (q1 + 1)));
-        const int i = base | cmask;
-        const int j = i | tmask;
-        const Complex<Real> tmp = tile[i];
-        tile[i] = tile[j];
-        tile[j] = tmp;
-    }
-    __syncthreads();
-}
-
 template <typename Real>
 __device__ void d_run_circuit(Complex<Real>* psi, const uint8_t* nibbles, int offset, int tid,
-                              int nthreads, char* dyn_tile)
+                              int nthreads)
 {
-#if defined(QHASH_FUSE_RZ_RY) && (QHASH_SMEM_TILE > 0)
-    constexpr int kTile = QHASH_SMEM_TILE;
-    constexpr int kTileQ = QHASH_SMEM_TILE_Q;
-    constexpr int kFiber = 1 << (QHASH_NUM_QUBITS - kTileQ);
-    constexpr int kFibersPerTile = kTile / kFiber;
-    constexpr int kNumFibers = 1 << kTileQ;
-    /* Raw bytes avoid non-trivial Complex/U2 ctors in __shared__ (nvcc #20054). */
-#if QHASH_SMEM_DYNAMIC
-    Complex<Real>* tile = reinterpret_cast<Complex<Real>*>(dyn_tile);
-#if QHASH_DYN_TILES > 1
-    Complex<Real>* tile_b = tile + kTile;
-#else
-    Complex<Real>* tile_b = tile;
-#endif
-#else
-    (void)dyn_tile;
-    __shared__ __align__(16) char tile_raw[kTile * sizeof(Complex<Real>)];
-    Complex<Real>* tile = reinterpret_cast<Complex<Real>*>(tile_raw);
-    Complex<Real>* tile_b = tile;
-#endif
-    __shared__ __align__(16) char us_raw[QHASH_NUM_QUBITS * sizeof(U2<Real>)];
-    U2<Real>* us = reinterpret_cast<U2<Real>*>(us_raw);
-
-    for (int l = 0; l < QHASH_NUM_LAYERS; ++l) {
-        if (tid < QHASH_NUM_QUBITS) {
-            const uint8_t ny =
-                nibbles[(2 * l * QHASH_NUM_QUBITS + tid) % QHASH_NIBBLE_COUNT];
-            const uint8_t nz =
-                nibbles[((2 * l + 1) * QHASH_NUM_QUBITS + tid) % QHASH_NIBBLE_COUNT];
-            us[tid] = make_rz_ry<Real>(nibble_angle<Real>(ny, offset),
-                                       nibble_angle<Real>(nz, offset));
-        }
-        __syncthreads();
-
-#if QHASH_DYN_TILES > 1
-        /* Low U2: double-buffered contiguous tiles. */
-        {
-            Complex<Real>* cur = tile;
-            Complex<Real>* nxt = tile_b;
-            for (int i = tid; i < kTile; i += nthreads)
-                cur[i] = psi[i];
-            __syncthreads();
-            for (int base = 0; base < QHASH_STATE_SIZE; base += kTile) {
-                for (int q = 0; q < kTileQ; ++q)
-                    d_apply_u2_n(cur, q, us[q], tid, nthreads, kTile);
-                const int next = base + kTile;
-                const int has_next = next < QHASH_STATE_SIZE;
-                for (int i = tid; i < kTile; i += nthreads) {
-                    psi[base + i] = cur[i];
-                    if (has_next)
-                        nxt[i] = psi[next + i];
-                }
-                __syncthreads();
-                Complex<Real>* tmp = cur;
-                cur = nxt;
-                nxt = tmp;
-            }
-        }
-
-        /* High U2: fiber double-buffer. */
-        {
-            Complex<Real>* cur = tile;
-            Complex<Real>* nxt = tile_b;
-            d_fiber_gather(cur, psi, 0, kFibersPerTile, kFiber, kTileQ, tid, nthreads);
-            for (int fb = 0; fb < kNumFibers; fb += kFibersPerTile) {
-                for (int q = kTileQ; q < QHASH_NUM_QUBITS; ++q)
-                    d_fiber_u2(cur, q - kTileQ, us[q], kFibersPerTile, kFiber, tid, nthreads);
-                const int next = fb + kFibersPerTile;
-                d_fiber_scatter_gather(psi, cur, nxt, fb, next, next < kNumFibers, kFibersPerTile,
-                                       kFiber, kTileQ, tid, nthreads);
-                Complex<Real>* tmp = cur;
-                cur = nxt;
-                nxt = tmp;
-            }
-        }
-
-        /* Low CNOT: double-buffered tiles. */
-        {
-            Complex<Real>* cur = tile;
-            Complex<Real>* nxt = tile_b;
-            for (int i = tid; i < kTile; i += nthreads)
-                cur[i] = psi[i];
-            __syncthreads();
-            for (int base = 0; base < QHASH_STATE_SIZE; base += kTile) {
-                for (int c = 0; c < kTileQ - 1; ++c)
-                    d_apply_cnot_n(cur, c, c + 1, tid, nthreads, kTile);
-                const int next = base + kTile;
-                const int has_next = next < QHASH_STATE_SIZE;
-                for (int i = tid; i < kTile; i += nthreads) {
-                    psi[base + i] = cur[i];
-                    if (has_next)
-                        nxt[i] = psi[next + i];
-                }
-                __syncthreads();
-                Complex<Real>* tmp = cur;
-                cur = nxt;
-                nxt = tmp;
-            }
-        }
-        d_apply_cnot(psi, kTileQ - 1, kTileQ, tid, nthreads);
-
-        /* High CNOT: fiber double-buffer. */
-        {
-            Complex<Real>* cur = tile;
-            Complex<Real>* nxt = tile_b;
-            d_fiber_gather(cur, psi, 0, kFibersPerTile, kFiber, kTileQ, tid, nthreads);
-            for (int fb = 0; fb < kNumFibers; fb += kFibersPerTile) {
-                for (int c = kTileQ; c < QHASH_NUM_QUBITS - 1; ++c)
-                    d_fiber_cnot(cur, c - kTileQ, c + 1 - kTileQ, kFibersPerTile, kFiber, tid,
-                                 nthreads);
-                const int next = fb + kFibersPerTile;
-                d_fiber_scatter_gather(psi, cur, nxt, fb, next, next < kNumFibers, kFibersPerTile,
-                                       kFiber, kTileQ, tid, nthreads);
-                Complex<Real>* tmp = cur;
-                cur = nxt;
-                nxt = tmp;
-            }
-        }
-#else
-        /*
-         * U2s on distinct qubits commute → do high U2s first, then fuse low U2
-         * + low CNOT in one tile residency (halves contiguous gather/scatter).
-         */
-        for (int fb = 0; fb < kNumFibers; fb += kFibersPerTile) {
-            d_fiber_gather(tile, psi, fb, kFibersPerTile, kFiber, kTileQ, tid, nthreads);
-#pragma unroll
-            for (int q = kTileQ; q < QHASH_NUM_QUBITS; ++q)
-                d_fiber_u2(tile, q - kTileQ, us[q], kFibersPerTile, kFiber, tid, nthreads);
-            d_fiber_scatter(psi, tile, fb, kFibersPerTile, kFiber, kTileQ, tid, nthreads);
-        }
-
-#if QHASH_BOUNDARY_PAIR && (QHASH_DYN_TILES > 1)
-        /* Dual-tile low section: U2 0..kTileQ-1 + CNOT 0..kTileQ in 2×kTile smem. */
-        {
-            constexpr int kPair = kTile * 2;
-            for (int base = 0; base < QHASH_STATE_SIZE; base += kPair) {
-                for (int i = tid; i < kPair; i += nthreads)
-                    tile[i] = psi[base + i];
-                __syncthreads();
-#pragma unroll
-                for (int q = 0; q < kTileQ; ++q)
-                    d_apply_u2_n(tile, q, us[q], tid, nthreads, kPair);
-#pragma unroll
-                for (int c = 0; c < kTileQ; ++c)
-                    d_apply_cnot_n(tile, c, c + 1, tid, nthreads, kPair);
-                for (int i = tid; i < kPair; i += nthreads)
-                    psi[base + i] = tile[i];
-                __syncthreads();
-            }
-        }
-#else
-        /* Single-tile: U2 + CNOT 0..kTileQ-2 fused; boundary CNOT stays global. */
-        for (int base = 0; base < QHASH_STATE_SIZE; base += kTile) {
-            for (int i = tid; i < kTile; i += nthreads)
-                tile[i] = psi[base + i];
-            __syncthreads();
-#pragma unroll
-            for (int q = 0; q < kTileQ; ++q)
-                d_apply_u2_n(tile, q, us[q], tid, nthreads, kTile);
-#pragma unroll
-            for (int c = 0; c < kTileQ - 1; ++c)
-                d_apply_cnot_n(tile, c, c + 1, tid, nthreads, kTile);
-            for (int i = tid; i < kTile; i += nthreads)
-                psi[base + i] = tile[i];
-            __syncthreads();
-        }
-        d_apply_cnot(psi, kTileQ - 1, kTileQ, tid, nthreads);
-#endif
-
-        /* High NN CNOTs: fiber-blocked (controls ≥ kTileQ). */
-        for (int fb = 0; fb < kNumFibers; fb += kFibersPerTile) {
-            d_fiber_gather(tile, psi, fb, kFibersPerTile, kFiber, kTileQ, tid, nthreads);
-#pragma unroll
-            for (int c = kTileQ; c < QHASH_NUM_QUBITS - 1; ++c)
-                d_fiber_cnot(tile, c - kTileQ, c + 1 - kTileQ, kFibersPerTile, kFiber, tid,
-                             nthreads);
-            d_fiber_scatter(psi, tile, fb, kFibersPerTile, kFiber, kTileQ, tid, nthreads);
-        }
-#endif
-    }
-#else
-    (void)dyn_tile;
     for (int l = 0; l < QHASH_NUM_LAYERS; ++l) {
         for (int i = 0; i < QHASH_NUM_QUBITS; ++i) {
             const uint8_t ny = nibbles[(2 * l * QHASH_NUM_QUBITS + i) % QHASH_NIBBLE_COUNT];
@@ -539,14 +205,8 @@ __device__ void d_run_circuit(Complex<Real>* psi, const uint8_t* nibbles, int of
         for (int i = 0; i < QHASH_NUM_QUBITS - 1; ++i)
             d_apply_cnot(psi, i, i + 1, tid, nthreads);
     }
-#endif
 }
 
-/**
- * ⟨Z⟩ for all qubits: one state scan, then per-qubit tree reduce.
- * Per-thread accumulation order for each qubit matches the old 16-pass loop
- * (i = tid, tid+nthreads, …); tree-reduce order unchanged — bit-exact Q1.15.
- */
 template <typename Real>
 __device__ void d_expectations(const Complex<Real>* psi, Real* exp_out, int tid, int nthreads)
 {
@@ -639,12 +299,7 @@ __global__ void qhash_mine_kernel(const uint8_t* header_template,
     __syncthreads();
 
     d_init_zero(psi, tid, nthreads);
-#if QHASH_SMEM_DYNAMIC
-    extern __shared__ __align__(16) char dyn_smem[];
-    d_run_circuit(psi, s_nibbles, offset, tid, nthreads, dyn_smem);
-#else
-    d_run_circuit(psi, s_nibbles, offset, tid, nthreads, nullptr);
-#endif
+    d_run_circuit(psi, s_nibbles, offset, tid, nthreads);
     d_expectations(psi, s_exp, tid, nthreads);
 
     if (tid == 0) {
@@ -687,12 +342,347 @@ __global__ void qhash_mine_kernel(const uint8_t* header_template,
     }
 }
 
+/* ======================================================================== *
+ * Phase 6: closed-form kernel — one nonce per thread                       *
+ *                                                                          *
+ * No state buffer, no per-nonce barrier, no global traffic beyond the share *
+ * queue. Everything a nonce needs is in registers plus a 512-byte angle     *
+ * table staged into shared memory once per block.                          *
+ * ======================================================================== */
+
+/**
+ * Per-job constants. All of it is read with a warp-uniform index, so constant
+ * memory broadcasts and costs nothing — except the angle table, whose index is a
+ * data-dependent nibble, so that one is staged into shared memory instead.
+ */
+struct CfParams {
+    uint32_t midstate[8]; /* SHA-256 state after header bytes 0..63 */
+    uint32_t hdr_w[3];    /* header bytes 64..75 as big-endian schedule words */
+    uint32_t pad_w[64];   /* constant schedule of the final hash's padding block */
+    uint32_t target[8];   /* target as big-endian words */
+    AngleLut lut;         /* built with host libm, so host and device agree exactly */
+    uint32_t nTime;
+    int check_target;
+};
+
+__constant__ CfParams c_cf;
+
+/** Byte-reverse, turning the little-endian header nonce into its schedule word. */
+__device__ __forceinline__ uint32_t cf_bswap32(uint32_t x)
+{
+    return ((x & 0x000000FFu) << 24) | ((x & 0x0000FF00u) << 8) | ((x & 0x00FF0000u) >> 8) |
+           ((x & 0xFF000000u) >> 24);
+}
+
+/** Big-endian 256-bit compare; equality counts as a hit, as in the byte loop. */
+__device__ __forceinline__ bool cf_le_target(const uint32_t h[8], const uint32_t t[8])
+{
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (h[i] < t[i])
+            return true;
+        if (h[i] > t[i])
+            return false;
+    }
+    return true;
+}
+
+__global__ void qhash_cf_kernel(uint32_t nonce_start, uint32_t nonce_count, qhash_share_t* shares,
+                                uint32_t* share_count, uint32_t max_shares)
+{
+    /* One barrier for the entire kernel: the grid-stride loop below runs many
+       nonces per thread, so this is amortised away rather than paid per nonce. */
+    __shared__ AngleLut s_lut;
+    {
+        double* dst = reinterpret_cast<double*>(&s_lut);
+        const double* src = reinterpret_cast<const double*>(&c_cf.lut);
+        for (int i = int(threadIdx.x); i < QHASH_ANGLE_LUT_DOUBLES; i += int(blockDim.x))
+            dst[i] = src[i];
+    }
+    __syncthreads();
+
+    const uint32_t stride = gridDim.x * blockDim.x;
+    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < nonce_count; idx += stride) {
+        const uint32_t nonce = nonce_start + idx;
+
+        /* --- SHA256(header): job midstate + the one nonce-dependent block --- */
+        uint32_t hs[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            hs[i] = c_cf.midstate[i];
+
+        uint32_t w[16];
+        w[0] = c_cf.hdr_w[0];
+        w[1] = c_cf.hdr_w[1];
+        w[2] = c_cf.hdr_w[2];
+        w[3] = cf_bswap32(nonce); /* header bytes 76..79 */
+        w[4] = 0x80000000u;       /* padding: W[4..15] are constants */
+#pragma unroll
+        for (int i = 5; i < 15; ++i)
+            w[i] = 0;
+        w[15] = QHASH_INPUT_SIZE * 8;
+        sha256_compress(hs, w);
+
+        /* --- closed-form ⟨Z⟩ straight out of the header hash words --- */
+        double e[QHASH_NUM_QUBITS];
+        closed_form_sweep(s_lut, NibbleWords{hs}, e);
+
+        /* --- Q1.15 little-endian pairs → schedule words 8..15, counting zeros --- */
+        uint32_t fw[16];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            fw[i] = hs[i];
+
+        int zeroes = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int16_t f0 = to_fixed_q15(e[2 * i]);
+            const int16_t f1 = to_fixed_q15(e[2 * i + 1]);
+            const uint32_t b0 = uint32_t(f0) & 0xFFu;
+            const uint32_t b1 = (uint32_t(f0) >> 8) & 0xFFu;
+            const uint32_t b2 = uint32_t(f1) & 0xFFu;
+            const uint32_t b3 = (uint32_t(f1) >> 8) & 0xFFu;
+            fw[8 + i] = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+            zeroes += int(b0 == 0) + int(b1 == 0) + int(b2 == 0) + int(b3 == 0);
+        }
+
+        uint32_t digest[8];
+        if (softfork_reject_zeroes(c_cf.nTime, zeroes)) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+                digest[i] = 0xFFFFFFFFu;
+        } else {
+            sha256_init(digest);
+            sha256_compress(digest, fw);
+            sha256_compress_const(digest, c_cf.pad_w);
+        }
+
+        if (c_cf.check_target && !cf_le_target(digest, c_cf.target))
+            continue;
+
+        const uint32_t slot = atomicAdd(share_count, 1u);
+        if (slot < max_shares) {
+            shares[slot].nonce = nonce;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                shares[slot].hash[4 * i + 0] = uint8_t(digest[i] >> 24);
+                shares[slot].hash[4 * i + 1] = uint8_t(digest[i] >> 16);
+                shares[slot].hash[4 * i + 2] = uint8_t(digest[i] >> 8);
+                shares[slot].hash[4 * i + 3] = uint8_t(digest[i]);
+            }
+        }
+    }
+}
+
 extern "C" int qhash_cuda_available(void)
 {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess)
         return 0;
     return n > 0;
+}
+
+extern "C" int qhash_cuda_sm_count(void)
+{
+    /* cudaGetDeviceProperties returns a struct whose layout moves between
+       toolkit versions; the attribute query is ABI-stable and is the only one
+       that reports the real count when the build and runtime headers differ. */
+    static int cached = -1;
+    if (cached < 0) {
+        int dev = 0, n = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+            cached = 0;
+        else
+            cached = n;
+    }
+    return cached;
+}
+
+namespace {
+
+/**
+ * Device buffers for the share queue, kept alive across calls. The closed-form
+ * kernel finishes a batch in a single launch, so per-call cudaMalloc/cudaFree
+ * would be a visible fraction of the runtime.
+ */
+struct CfBuffers {
+    std::mutex mu;
+    qhash_share_t* shares = nullptr;
+    uint32_t* count = nullptr;
+    uint32_t capacity = 0;
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+};
+
+CfBuffers& cf_buffers()
+{
+    static CfBuffers b;
+    return b;
+}
+
+int cf_reserve(CfBuffers& b, uint32_t max_shares)
+{
+    if (!b.start) {
+        CUDA_CHECK(cudaEventCreate(&b.start));
+        CUDA_CHECK(cudaEventCreate(&b.stop));
+    }
+    if (!b.count)
+        CUDA_CHECK(cudaMalloc(&b.count, sizeof(uint32_t)));
+    if (b.capacity >= max_shares && b.shares)
+        return 0;
+    if (b.shares)
+        cudaFree(b.shares);
+    b.shares = nullptr;
+    b.capacity = 0;
+    CUDA_CHECK(cudaMalloc(&b.shares, size_t(max_shares) * sizeof(qhash_share_t)));
+    b.capacity = max_shares;
+    return 0;
+}
+
+std::atomic<uint64_t> g_reverify_checked{0};
+std::atomic<uint64_t> g_reverify_rejected{0};
+
+/**
+ * Phase 6.12: re-run every candidate through the statevector oracle on the CPU
+ * before it can leave this function.
+ *
+ * The closed form agrees with the statevector on every one of the millions of
+ * nonces the Phase-6 harness checked, but the two differ by ~1e-14 in ⟨Z⟩, and a
+ * value sitting exactly on a Q1.15 rounding boundary has no defined FP64 answer.
+ * Re-verifying closes that gap completely: the digest that gets submitted is the
+ * oracle's, and it is re-tested against the target, so a boundary case can only
+ * ever cost us a share, never produce an invalid one.
+ *
+ * Candidates are rare at any real difficulty, so this is free. It is skipped when
+ * check_target is 0, because then every nonce is a "candidate" and the caller is a
+ * test harness comparing raw digests, not a miner.
+ */
+uint32_t cf_reverify_candidates(const qhash_job_t* job, qhash_share_t* shares, uint32_t count)
+{
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t nonce = shares[i].nonce;
+        uint8_t header[QHASH_INPUT_SIZE];
+        std::memcpy(header, job->header, QHASH_INPUT_SIZE);
+        header[76] = uint8_t(nonce);
+        header[77] = uint8_t(nonce >> 8);
+        header[78] = uint8_t(nonce >> 16);
+        header[79] = uint8_t(nonce >> 24);
+
+        uint8_t ref[QHASH_SHA256_SIZE];
+        qhash_hash_cpu_sim(header, ref, QHASH_PRECISION_FP64, job->nTime,
+                           QHASH_SIM_STATEVECTOR);
+        ++g_reverify_checked;
+
+        bool meets = true;
+        for (int b = 0; b < QHASH_SHA256_SIZE; ++b) {
+            if (ref[b] < job->target[b])
+                break;
+            if (ref[b] > job->target[b]) {
+                meets = false;
+                break;
+            }
+        }
+        if (!meets) {
+            ++g_reverify_rejected;
+            continue;
+        }
+        shares[kept].nonce = nonce;
+        std::memcpy(shares[kept].hash, ref, QHASH_SHA256_SIZE);
+        ++kept;
+    }
+    return kept;
+}
+
+} // namespace
+
+extern "C" void qhash_cuda_reverify_stats(uint64_t* checked, uint64_t* rejected)
+{
+    if (checked)
+        *checked = g_reverify_checked.load();
+    if (rejected)
+        *rejected = g_reverify_rejected.load();
+}
+
+static int mine_batch_closed_form(const qhash_job_t* job, qhash_share_t* shares_out,
+                                  uint32_t max_shares, uint32_t* share_count, double* seconds_out)
+{
+    const uint32_t n = job->nonce_count;
+    if (n == 0)
+        return 0;
+
+    CfParams p{};
+    sha256_midstate(job->header, p.midstate);
+    p.hdr_w[0] = sha256_load_be(job->header + 64);
+    p.hdr_w[1] = sha256_load_be(job->header + 68);
+    p.hdr_w[2] = sha256_load_be(job->header + 72);
+    sha256_pad_schedule(p.pad_w, QHASH_SHA256_SIZE + QHASH_NUM_QUBITS * sizeof(int16_t));
+    for (int i = 0; i < 8; ++i)
+        p.target[i] = sha256_load_be(job->target + 4 * i);
+    p.lut = host_angle_lut(angle_offset(job->nTime));
+    p.nTime = job->nTime;
+    p.check_target = job->check_target;
+
+    int threads = job->threads_per_block > 0 ? job->threads_per_block : QHASH_CF_DEFAULT_THREADS;
+    if (threads < 32)
+        threads = 32;
+    if (threads > 1024)
+        threads = 1024;
+
+    /* Persistent grid: fill every SM to its occupancy limit, then keep that many
+       blocks resident and let the grid-stride loop walk the batch. Asking the
+       occupancy API means the waves stay full whatever the register count ends up
+       being after a compiler change. */
+    int blocks = job->blocks;
+    if (blocks <= 0) {
+        const int sms = qhash_cuda_sm_count();
+        int per_sm = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, qhash_cf_kernel, threads, 0) !=
+                cudaSuccess ||
+            per_sm < 1)
+            per_sm = QHASH_CF_BLOCKS_PER_SM;
+        blocks = (sms > 0 ? sms : 16) * per_sm * QHASH_CF_WAVES;
+    }
+    const int need = int((size_t(n) + size_t(threads) - 1) / size_t(threads));
+    if (blocks > need)
+        blocks = need;
+    if (blocks < 1)
+        blocks = 1;
+
+    CfBuffers& buf = cf_buffers();
+    std::lock_guard<std::mutex> lock(buf.mu);
+    if (cf_reserve(buf, max_shares ? max_shares : 1) != 0)
+        return -1;
+
+    CUDA_CHECK(cudaMemcpyToSymbol(c_cf, &p, sizeof(p)));
+    CUDA_CHECK(cudaMemset(buf.count, 0, sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaEventRecord(buf.start));
+
+    qhash_cf_kernel<<<blocks, threads>>>(job->nonce_start, n, buf.shares, buf.count, max_shares);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaEventRecord(buf.stop));
+    CUDA_CHECK(cudaEventSynchronize(buf.stop));
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, buf.start, buf.stop));
+    if (seconds_out)
+        *seconds_out = double(ms) * 1e-3;
+
+    uint32_t count = 0;
+    CUDA_CHECK(cudaMemcpy(&count, buf.count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    if (count > max_shares)
+        count = max_shares;
+    if (count && shares_out) {
+        CUDA_CHECK(cudaMemcpy(shares_out, buf.shares, count * sizeof(qhash_share_t),
+                              cudaMemcpyDeviceToHost));
+        if (job->check_target)
+            count = cf_reverify_candidates(job, shares_out, count);
+    }
+    if (share_count)
+        *share_count = count;
+    return 0;
 }
 
 extern "C" int qhash_hash_gpu(const uint8_t header[QHASH_INPUT_SIZE],
@@ -761,16 +751,6 @@ static int mine_batch_typed(const qhash_job_t* job, qhash_share_t* shares_out, u
 
     const int offset = angle_offset(job->nTime);
 
-#if QHASH_SMEM_DYNAMIC
-    /* Opt-in past 48 KiB static cap (Blackwell Laptop: sharedMemPerBlockOptin ≈ 99 KiB). */
-    const size_t dyn_smem =
-        size_t(QHASH_DYN_TILES) * size_t(QHASH_SMEM_TILE) * sizeof(Complex<Real>);
-    CUDA_CHECK(cudaFuncSetAttribute(qhash_mine_kernel<Real>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, int(dyn_smem)));
-#else
-    const size_t dyn_smem = 0;
-#endif
-
     cudaStream_t streams[QHASH_MAX_STREAMS];
     for (int s = 0; s < nstreams; ++s)
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
@@ -787,7 +767,7 @@ static int mine_batch_typed(const qhash_job_t* job, qhash_share_t* shares_out, u
         if (cursor >= n)
             break;
         const uint32_t slice = (cursor + base > n) ? (n - cursor) : base;
-        qhash_mine_kernel<Real><<<int(slice), threads, dyn_smem, streams[s]>>>(
+        qhash_mine_kernel<Real><<<int(slice), threads, 0, streams[s]>>>(
             d_header, job->nonce_start + cursor, job->nTime, offset, d_target, job->check_target,
             d_states + size_t(cursor) * QHASH_STATE_SIZE, d_shares, d_count, max_shares, nullptr);
         CUDA_CHECK(cudaGetLastError());
@@ -872,14 +852,28 @@ extern "C" int qhash_mine_batch(const qhash_job_t* job, qhash_share_t* shares_ou
         return 0;
     }
 
+    /* FP32 exists only to reproduce the legacy miner's statevector rounding, so it
+       always takes the oracle path; the closed form is an FP64 identity. */
     if (job->precision == QHASH_PRECISION_FP32)
         return mine_batch_typed<float>(job, shares_out, max_shares, share_count, seconds_out);
-    return mine_batch_typed<double>(job, shares_out, max_shares, share_count, seconds_out);
+    if (job->sim == QHASH_SIM_STATEVECTOR)
+        return mine_batch_typed<double>(job, shares_out, max_shares, share_count, seconds_out);
+    return mine_batch_closed_form(job, shares_out, max_shares, share_count, seconds_out);
 }
 
 #else /* QHASH_CPU_ONLY */
 
 extern "C" int qhash_cuda_available(void) { return 0; }
+
+extern "C" int qhash_cuda_sm_count(void) { return 0; }
+
+extern "C" void qhash_cuda_reverify_stats(uint64_t* checked, uint64_t* rejected)
+{
+    if (checked)
+        *checked = 0;
+    if (rejected)
+        *rejected = 0;
+}
 
 extern "C" int qhash_hash_gpu(const uint8_t header[QHASH_INPUT_SIZE],
                               uint8_t out[QHASH_SHA256_SIZE],

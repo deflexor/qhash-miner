@@ -1,8 +1,15 @@
 #pragma once
 /**
- * Phase-1 monolithic CUDA mining kernel API.
- * One block per nonce; threads cooperate on a shared global state vector.
+ * CUDA mining kernel API.
+ *
+ * Default path (Phase 6): the closed-form ⟨Z⟩ sweep, one nonce per thread, in a
+ * persistent grid-stride kernel with no state buffer and no per-nonce barriers.
+ *
+ * Setting job.sim to QHASH_SIM_STATEVECTOR selects the original one-block-per-nonce
+ * 65536-amplitude kernel, which is retained as the consensus oracle for A/B checks
+ * and for re-verifying candidate nonces before a share is submitted.
  */
+#include "qhash_cpu.h"
 #include "qhash_params.h"
 #include <stdint.h>
 
@@ -16,18 +23,38 @@ typedef struct {
     uint32_t nTime;                 /* soft-fork clock */
     qhash_precision_t precision;
     uint8_t header[QHASH_INPUT_SIZE]; /* template; nonce at bytes 76..79 overwritten */
-    uint8_t target[QHASH_SHA256_SIZE]; /* little-endian 256-bit target; all-FF = no check */
-    int check_target;               /* 0 = hash only / benchmark */
-    int threads_per_block;          /* 128 or 256; 0 = default (256) */
-    int num_streams;                /* 1..4 concurrent chunk streams; 0 = default (1) */
+    uint8_t target[QHASH_SHA256_SIZE]; /* big-endian 256-bit target; all-FF = no check */
+    int check_target;               /* 0 = record every digest (small batches only) */
+    int threads_per_block;          /* 0 = default */
+    int num_streams;                /* statevector path only: 1..4 chunk streams */
+    /* Fields below were appended after the official-miner integration; that tree
+       zero-initialises qhash_job_t, so 0 must always mean "default". */
+    qhash_sim_t sim;                /* 0 = closed form, 1 = statevector oracle */
+    int blocks;                     /* closed-form grid size; 0 = occupancy-derived */
 } qhash_job_t;
 
-/** Default launch geometry (Phase 3 occupancy sweep). */
+/**
+ * Launch geometry defaults.
+ *
+ * The statevector kernel wants 256 threads (one block per nonce, cooperating over
+ * a 1 MiB state). The closed-form kernel is one nonce per thread and is retuned
+ * from scratch in Phase 6.11 — the old numbers do not transfer.
+ */
 enum {
     QHASH_DEFAULT_THREADS = 256,
     QHASH_MAX_THREADS = 256,
     QHASH_DEFAULT_STREAMS = 1,
-    QHASH_MAX_STREAMS = 4
+    QHASH_MAX_STREAMS = 4,
+    /* Phase 6.11 sweep on an RTX 5060 Laptop: 128/256/512 threads land within 1%
+       of each other (285.4 / 286.8 / 284.4 Mh/s), and resident waves from 1 to 16
+       within 1% as well. The kernel is FP64-issue-bound, so occupancy stopped
+       being the lever — these are just the middle of a flat region. */
+    QHASH_CF_DEFAULT_THREADS = 256,
+    /* Fallback only, for when the occupancy API cannot be queried. */
+    QHASH_CF_BLOCKS_PER_SM = 8,
+    /* Resident waves of full-occupancy blocks; more than one only helps to even
+       out the tail when nonce_count is not a clean multiple of the grid. */
+    QHASH_CF_WAVES = 4
 };
 
 typedef struct {
@@ -53,6 +80,17 @@ int qhash_hash_gpu(const uint8_t header[QHASH_INPUT_SIZE],
                    uint32_t nTime);
 
 int qhash_cuda_available(void);
+
+/** Number of SMs on the current device, or 0 if there is none. */
+int qhash_cuda_sm_count(void);
+
+/**
+ * Phase 6.12 counters. Every candidate the closed-form kernel finds is re-hashed
+ * with the statevector oracle before it is returned as a share; `rejected` counts
+ * candidates the oracle did not confirm against the target. It should stay 0 —
+ * a nonzero value means a Q1.15 boundary case was caught doing exactly its job.
+ */
+void qhash_cuda_reverify_stats(uint64_t* checked, uint64_t* rejected);
 
 #ifdef __cplusplus
 }

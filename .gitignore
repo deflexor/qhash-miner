@@ -5,7 +5,9 @@ build-*/
 *.a
 *.so
 .cache/
+.proto/
 phase4_*.log
+phase6_*.log
 bench-*.log
 .pool-wallet-test.txt
 pool-accept*.log

@@ -2,8 +2,10 @@
  * Correctness & SHA-256 unit tests (CPU). Run without a GPU.
  */
 #include "circuit.cuh"
+#include "closed_form.cuh"
 #include "qhash_cpu.h"
 #include "sha256.cuh"
+#include "sha256_mine.cuh"
 
 #include <cstdio>
 #include <cstring>
@@ -44,6 +46,89 @@ static void test_sha256_abc()
         0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00,
         0x15, 0xad};
     EXPECT(std::memcmp(out, exp, 32) == 0, "SHA256(\"abc\") NIST vector");
+}
+
+/**
+ * The mining SHA-256 path re-associates the same arithmetic: header midstate plus
+ * one block, then two blocks for the 64-byte final hash with a constant-folded
+ * padding schedule. It must reproduce the one-shot sha256() exactly.
+ */
+static void test_sha256_mining_path()
+{
+    uint8_t header[QHASH_INPUT_SIZE];
+    for (int i = 0; i < QHASH_INPUT_SIZE; ++i)
+        header[i] = uint8_t(7 * i + 3);
+
+    uint32_t midstate[8];
+    sha256_midstate(header, midstate);
+
+    uint32_t w[16];
+    w[0] = sha256_load_be(header + 64);
+    w[1] = sha256_load_be(header + 68);
+    w[2] = sha256_load_be(header + 72);
+    w[3] = sha256_load_be(header + 76);
+    w[4] = 0x80000000u;
+    for (int i = 5; i < 15; ++i)
+        w[i] = 0;
+    w[15] = QHASH_INPUT_SIZE * 8;
+    uint32_t hs[8];
+    for (int i = 0; i < 8; ++i)
+        hs[i] = midstate[i];
+    sha256_compress(hs, w);
+
+    uint8_t want[32];
+    sha256(header, QHASH_INPUT_SIZE, want);
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t got = hs[i];
+        const uint32_t exp = sha256_load_be(want + 4 * i);
+        EXPECT(got == exp, "midstate + header block 2 == sha256(80 bytes)");
+    }
+
+    /* 64-byte second stage: one data block, then the constant padding block. */
+    uint8_t buf[64];
+    for (int i = 0; i < 64; ++i)
+        buf[i] = uint8_t(31 * i + 11);
+
+    uint32_t fs[8];
+    sha256_init(fs);
+    uint32_t fw[16];
+    for (int i = 0; i < 16; ++i)
+        fw[i] = sha256_load_be(buf + 4 * i);
+    sha256_compress(fs, fw);
+    uint32_t pad[64];
+    sha256_pad_schedule(pad, 64);
+    sha256_compress_const(fs, pad);
+
+    sha256(buf, 64, want);
+    for (int i = 0; i < 8; ++i)
+        EXPECT(fs[i] == sha256_load_be(want + 4 * i),
+               "rolling + constant-folded blocks == sha256(64 bytes)");
+}
+
+/** The word-indexed nibble accessor must agree with split_nibbles. */
+static void test_nibble_words()
+{
+    uint8_t hash[32];
+    for (int i = 0; i < 32; ++i)
+        hash[i] = uint8_t(13 * i + 5);
+    uint8_t nibbles[QHASH_NIBBLE_COUNT];
+    split_nibbles(hash, nibbles);
+
+    uint32_t words[8];
+    for (int i = 0; i < 8; ++i)
+        words[i] = sha256_load_be(hash + 4 * i);
+
+    NibbleWords nw{words};
+    for (int i = 0; i < QHASH_NIBBLE_COUNT; ++i)
+        EXPECT(nw(i) == int(nibbles[i]), "NibbleWords matches split_nibbles");
+
+    /* ...and the sweep gives the same answer through either accessor. */
+    double a[QHASH_NUM_QUBITS], b[QHASH_NUM_QUBITS];
+    const AngleLut& lut = host_angle_lut(1);
+    closed_form_sweep(lut, NibbleBytes{nibbles}, a);
+    closed_form_sweep(lut, nw, b);
+    for (int q = 0; q < QHASH_NUM_QUBITS; ++q)
+        EXPECT(a[q] == b[q], "closed-form sweep identical for both nibble sources");
 }
 
 static void test_identity_circuit_measure()
@@ -126,6 +211,8 @@ int main()
 {
     test_sha256_empty();
     test_sha256_abc();
+    test_sha256_mining_path();
+    test_nibble_words();
     test_identity_circuit_measure();
     test_ry_pi();
     test_cnot_entangle();

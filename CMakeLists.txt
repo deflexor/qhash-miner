@@ -7,10 +7,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(QHASH_ENABLE_CUDA "Build CUDA mining kernel" ON)
 option(QHASH_FUSE_RZ_RY "Fuse Rz·Ry into one 2×2 per qubit/layer (Phase 2)" ON)
 option(QHASH_ENABLE_CUSTATEVEC "Build cuStateVec FP64 golden harness" ON)
-set(QHASH_SMEM_TILE "2048" CACHE STRING "Shared-memory tile amps (0|1024|2048|4096); 4096 needs dynamic smem for FP64")
-option(QHASH_BOUNDARY_PAIR "Dual-tile low section so CNOT(tileQ-1,tileQ) stays in smem (usually slower)" OFF)
+# QHASH_SMEM_TILE / QHASH_BOUNDARY_PAIR were retired in Phase 6.13: they only ever
+# tuned the statevector kernel, which the closed-form sweep replaced for mining and
+# which now exists purely as the consensus oracle.
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
+
+# Consensus digests depend on exact FP64 rounding, and the closed-form sweep is
+# compared byte-for-byte between host and device. Disable floating-point
+# contraction on both compilers so a*b+c is never fused into an fma, which would
+# make the two sides differ in the last ulp.
+add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+)
 
 set(QHASH_COMMON_SRC
     src/qhash_cpu.cpp
@@ -60,14 +70,6 @@ if(QHASH_FUSE_RZ_RY)
     target_compile_definitions(qhash_core PUBLIC QHASH_FUSE_RZ_RY)
 endif()
 
-target_compile_definitions(qhash_core PUBLIC QHASH_SMEM_TILE=${QHASH_SMEM_TILE})
-if(QHASH_BOUNDARY_PAIR)
-    target_compile_definitions(qhash_core PUBLIC QHASH_BOUNDARY_PAIR=1)
-else()
-    target_compile_definitions(qhash_core PUBLIC QHASH_BOUNDARY_PAIR=0)
-endif()
-message(STATUS "QHASH_SMEM_TILE=${QHASH_SMEM_TILE} QHASH_BOUNDARY_PAIR=${QHASH_BOUNDARY_PAIR}")
-
 target_include_directories(qhash_core PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(qhash_core PUBLIC m)
 
@@ -77,8 +79,26 @@ target_link_libraries(qhash-miner PRIVATE qhash_core)
 add_executable(qhash-test tests/test_circuit.cpp)
 target_link_libraries(qhash-test PRIVATE qhash_core)
 
+find_package(Threads REQUIRED)
+add_executable(qhash-closed-form-check tests/closed_form_check.cpp)
+target_link_libraries(qhash-closed-form-check PRIVATE qhash_core Threads::Threads)
+
 add_executable(qhash-bench bench/benchmark.cpp)
 target_link_libraries(qhash-bench PRIVATE qhash_core)
+
+# Ablation profile: splits the closed-form kernel into its SHA-256 and FP64 halves
+# to decide whether Phase 6.14 (float-float FP32) is worth anything.
+if(QHASH_HAS_CUDA)
+    add_executable(qhash-cf-ablation bench/cf_ablation.cu)
+    set_target_properties(qhash-cf-ablation PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_ARCHITECTURES "75;86;89;90;120"
+    )
+    target_compile_options(qhash-cf-ablation PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    )
+    target_link_libraries(qhash-cf-ablation PRIVATE qhash_core CUDA::cudart)
+endif()
 
 add_library(qhash_byos STATIC src/byos/qhash_byos.cpp)
 target_link_libraries(qhash_byos PUBLIC qhash_core)
@@ -109,14 +129,8 @@ if(QHASH_HAS_CUDA)
     )
     target_include_directories(qhash_byos_plugin PUBLIC ${CMAKE_SOURCE_DIR}/include)
     target_link_libraries(qhash_byos_plugin PUBLIC CUDA::cudart m)
-    target_compile_definitions(qhash_byos_plugin PUBLIC QHASH_SMEM_TILE=${QHASH_SMEM_TILE})
     if(QHASH_FUSE_RZ_RY)
         target_compile_definitions(qhash_byos_plugin PUBLIC QHASH_FUSE_RZ_RY)
-    endif()
-    if(QHASH_BOUNDARY_PAIR)
-        target_compile_definitions(qhash_byos_plugin PUBLIC QHASH_BOUNDARY_PAIR=1)
-    else()
-        target_compile_definitions(qhash_byos_plugin PUBLIC QHASH_BOUNDARY_PAIR=0)
     endif()
     if(QHASH_BYOS_FP64)
         target_compile_definitions(qhash_byos_plugin PUBLIC QHASH_BYOS_FP64=1)
@@ -149,6 +163,9 @@ endif()
 enable_testing()
 add_test(NAME circuit COMMAND qhash-test)
 add_test(NAME selftest COMMAND qhash-miner --self-test)
+# Quick variant for ctest; the full 1M-nonce gate is run by hand (see PLAN.md).
+add_test(NAME closed_form COMMAND qhash-closed-form-check --mode degenerate)
+add_test(NAME closed_form_softfork COMMAND qhash-closed-form-check --mode softfork)
 if(QHASH_HAS_CUSTATEVEC)
     add_test(NAME custatevec_golden COMMAND qhash-custatevec-golden --nonces 64)
 endif()

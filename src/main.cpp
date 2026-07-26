@@ -10,6 +10,7 @@
 #include "circuit.cuh"
 #include "sha256.cuh"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,13 +21,23 @@ static void usage(const char* argv0)
 {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --benchmark [--nonces N] [--chunk C] [--threads T] [--streams S]\n"
-                 "                 [--fp32] [--ntime T]\n"
+                 "  %s --benchmark [--nonces N] [--threads T] [--blocks B] [--sim S]\n"
+                 "                 [--chunk C] [--streams S] [--fp32] [--ntime T]\n"
                  "  %s --compare-fp [--nonces N] [--q15-nonces M] [--chunk C] [--threads T]\n"
                  "                 [--ntime T]  (Phase 4: digests×N, Q1.15×M default min(N,100k))\n"
                  "  %s --hash-hex <160 hex chars of 80-byte header>\n"
                  "  %s --self-test\n"
-                 "  T = 128|256 (default 256); S = 1..4 concurrent streams (default 1)\n",
+                 "\n"
+                 "  --sim closed|statevector  simulator (default closed form)\n"
+                 "  --threads T               32..1024 for the closed form; 128|256 statevector\n"
+                 "  --blocks B                closed-form grid size; 0 = fill the device\n"
+                 "  --chunk C                 nonces per launch; 0 = whole batch in one launch\n"
+                 "                            (statevector default 128, it needs ~1 MiB/nonce)\n"
+                 "  --streams S               statevector path only\n"
+                 "\n"
+                 "  Sustained closed-form rate needs a multi-second load, e.g.\n"
+                 "    --benchmark --nonces 4000000000 --chunk 4194304\n"
+                 "  A single cold launch reads low: the GPU has not boosted yet.\n",
                  argv0, argv0, argv0, argv0);
 }
 
@@ -72,19 +83,26 @@ static int self_test()
     header[70] = uint8_t(nTime >> 16);
     header[71] = uint8_t(nTime >> 24);
 
-    uint8_t h64[32], h32[32];
-    qhash_hash_cpu(header, h64, QHASH_PRECISION_FP64, nTime);
+    uint8_t h64[32], h32[32], hcf[32];
+    qhash_hash_cpu_sim(header, h64, QHASH_PRECISION_FP64, nTime, QHASH_SIM_STATEVECTOR);
     qhash_hash_cpu(header, h32, QHASH_PRECISION_FP32, nTime);
+    qhash_hash_cpu_sim(header, hcf, QHASH_PRECISION_FP64, nTime, QHASH_SIM_CLOSED_FORM);
 
     std::printf("self-test zero-header FP64: ");
     print_hex(h64, 32);
     std::printf("\nself-test zero-header FP32: ");
     print_hex(h32, 32);
+    std::printf("\nself-test zero-header closed form: ");
+    print_hex(hcf, 32);
     std::printf("\n");
+    if (std::memcmp(h64, hcf, 32) != 0) {
+        std::fprintf(stderr, "FAIL: CPU closed form != CPU statevector\n");
+        return 1;
+    }
 
     /* Determinism */
     uint8_t h64b[32];
-    qhash_hash_cpu(header, h64b, QHASH_PRECISION_FP64, nTime);
+    qhash_hash_cpu_sim(header, h64b, QHASH_PRECISION_FP64, nTime, QHASH_SIM_STATEVECTOR);
     if (std::memcmp(h64, h64b, 32) != 0) {
         std::fprintf(stderr, "FAIL: FP64 non-deterministic\n");
         return 1;
@@ -135,10 +153,35 @@ static int self_test()
         job.check_target = 0;
         std::memset(job.target, 0xFF, 32);
 
-        const int thread_cfgs[] = {256, 128};
-        for (int tc : thread_cfgs) {
+        /* Oracle digests for nonces 0..kGold-1, straight from the statevector. */
+        std::vector<std::array<uint8_t, 32>> oracle(kGold);
+        for (uint32_t i = 0; i < kGold; ++i) {
+            uint8_t hdr[QHASH_INPUT_SIZE];
+            std::memcpy(hdr, job.header, QHASH_INPUT_SIZE);
+            hdr[76] = uint8_t(i);
+            hdr[77] = uint8_t(i >> 8);
+            hdr[78] = uint8_t(i >> 16);
+            hdr[79] = uint8_t(i >> 24);
+            qhash_hash_cpu_sim(hdr, oracle[i].data(), QHASH_PRECISION_FP64, nTime,
+                               QHASH_SIM_STATEVECTOR);
+        }
+
+        struct GoldCfg {
+            qhash_sim_t sim;
+            int threads;
+            int streams;
+        };
+        const GoldCfg cfgs[] = {
+            {QHASH_SIM_CLOSED_FORM, 256, 1},
+            {QHASH_SIM_CLOSED_FORM, 64, 1},
+            {QHASH_SIM_STATEVECTOR, 256, 1},
+            {QHASH_SIM_STATEVECTOR, 128, 2}, /* also exercise multi-stream once */
+        };
+        for (const GoldCfg& cfg : cfgs) {
+            const int tc = cfg.threads;
+            job.sim = cfg.sim;
             job.threads_per_block = tc;
-            job.num_streams = (tc == 128) ? 2 : 1; /* also exercise multi-stream once */
+            job.num_streams = cfg.streams;
             std::vector<qhash_share_t> shares(kGold);
             uint32_t share_count = 0;
             double secs = 0;
@@ -149,14 +192,6 @@ static int self_test()
                 return 1;
             }
             for (uint32_t i = 0; i < kGold; ++i) {
-                uint8_t hdr[QHASH_INPUT_SIZE];
-                std::memcpy(hdr, job.header, QHASH_INPUT_SIZE);
-                hdr[76] = uint8_t(i);
-                hdr[77] = uint8_t(i >> 8);
-                hdr[78] = uint8_t(i >> 16);
-                hdr[79] = uint8_t(i >> 24);
-                uint8_t cref[32];
-                qhash_hash_cpu(hdr, cref, QHASH_PRECISION_FP64, nTime);
                 const qhash_share_t* s = nullptr;
                 for (uint32_t j = 0; j < share_count; ++j) {
                     if (shares[j].nonce == i) {
@@ -164,13 +199,69 @@ static int self_test()
                         break;
                     }
                 }
-                if (!s || std::memcmp(s->hash, cref, 32) != 0) {
-                    std::fprintf(stderr, "FAIL: GPU!=CPU at nonce %u threads=%d\n", i, tc);
+                if (!s || std::memcmp(s->hash, oracle[i].data(), 32) != 0) {
+                    std::fprintf(stderr, "FAIL: GPU!=CPU statevector at nonce %u threads=%d\n", i,
+                                 tc);
                     return 1;
                 }
             }
-            std::printf("self-test GPU vs CPU: %u nonces bit-exact OK (threads=%d streams=%d, %.3f s)\n",
-                        kGold, tc, job.num_streams, secs);
+            std::printf("self-test GPU %-11s vs CPU statevector: %u nonces bit-exact OK "
+                        "(threads=%d streams=%d, %.3f s)\n",
+                        cfg.sim == QHASH_SIM_CLOSED_FORM ? "closed-form" : "statevector", kGold, tc,
+                        job.num_streams, secs);
+        }
+
+        /* Phase 6.12: mine with a target loose enough to produce candidates, and
+           confirm each returned share carries the oracle's digest and clears the
+           target. A leading target byte of 0x04 hits roughly 1 nonce in 64. */
+        {
+            constexpr uint32_t kMine = 4096;
+            job.sim = QHASH_SIM_CLOSED_FORM;
+            job.threads_per_block = 256;
+            job.num_streams = 1;
+            job.blocks = 0;
+            job.nonce_start = 0;
+            job.nonce_count = kMine;
+            job.check_target = 1;
+            std::memset(job.target, 0xFF, 32);
+            job.target[0] = 0x04;
+
+            std::vector<qhash_share_t> shares(kMine);
+            uint32_t found = 0;
+            double secs = 0;
+            if (qhash_mine_batch(&job, shares.data(), kMine, &found, &secs) != 0) {
+                std::fprintf(stderr, "FAIL: candidate mining batch\n");
+                return 1;
+            }
+            for (uint32_t i = 0; i < found; ++i) {
+                uint8_t hdr[QHASH_INPUT_SIZE];
+                std::memcpy(hdr, job.header, QHASH_INPUT_SIZE);
+                const uint32_t n = shares[i].nonce;
+                hdr[76] = uint8_t(n);
+                hdr[77] = uint8_t(n >> 8);
+                hdr[78] = uint8_t(n >> 16);
+                hdr[79] = uint8_t(n >> 24);
+                uint8_t sv[32];
+                qhash_hash_cpu_sim(hdr, sv, QHASH_PRECISION_FP64, nTime, QHASH_SIM_STATEVECTOR);
+                if (std::memcmp(shares[i].hash, sv, 32) != 0) {
+                    std::fprintf(stderr, "FAIL: share %u digest is not the oracle's\n", n);
+                    return 1;
+                }
+                if (shares[i].hash[0] > job.target[0]) {
+                    std::fprintf(stderr, "FAIL: share %u does not meet the target\n", n);
+                    return 1;
+                }
+            }
+            uint64_t checked = 0, rejected = 0;
+            qhash_cuda_reverify_stats(&checked, &rejected);
+            if (found == 0 || checked < found) {
+                std::fprintf(stderr, "FAIL: re-verification did not run (%u shares, %llu checked)\n",
+                             found, (unsigned long long)checked);
+                return 1;
+            }
+            std::printf("self-test candidate re-verification: %u shares, %llu oracle checks, "
+                        "%llu rejected\n",
+                        found, (unsigned long long)checked, (unsigned long long)rejected);
         }
     }
 
@@ -179,7 +270,7 @@ static int self_test()
 }
 
 static int run_benchmark(uint32_t nonces, qhash_precision_t prec, uint32_t nTime, uint32_t chunk,
-                         int threads, int streams)
+                         int threads, int streams, qhash_sim_t sim, int blocks)
 {
     qhash_job_t job{};
     std::memset(job.header, 0xA5, QHASH_INPUT_SIZE);
@@ -187,32 +278,35 @@ static int run_benchmark(uint32_t nonces, qhash_precision_t prec, uint32_t nTime
     job.header[69] = uint8_t(nTime >> 8);
     job.header[70] = uint8_t(nTime >> 16);
     job.header[71] = uint8_t(nTime >> 24);
-    job.nonce_start = 0;
-    job.nonce_count = nonces;
     job.nTime = nTime;
     job.precision = prec;
-    job.check_target = 0;
     job.threads_per_block = threads;
     job.num_streams = streams;
-    std::memset(job.target, 0xFF, 32);
+    job.sim = sim;
+    job.blocks = blocks;
 
-    /* Cap recorded shares to avoid huge host buffers; throughput uses kernel time. */
-    const uint32_t max_shares = nonces < 64 ? nonces : 64;
-    std::vector<qhash_share_t> shares(max_shares);
+    /* An unreachable target keeps the share queue empty, so the measurement is not
+       one atomicAdd per nonce on a single counter. */
+    job.check_target = 1;
+    std::memset(job.target, 0x00, 32);
+
+    qhash_share_t share{};
     uint32_t share_count = 0;
     double seconds = 0;
 
-    /* Chunk large runs so FP64 state batch fits in GPU memory (~1MB/nonce).
-       Swept on RTX 5060 Laptop (Phase 3.1): chunk=128 / threads=256 ≈ peak. */
+    /* The closed-form kernel holds no per-nonce state, so a batch is one launch.
+       The statevector kernel needs ~1 MiB per nonce and must stay chunked. */
+    const bool statevector = (sim == QHASH_SIM_STATEVECTOR) || (prec == QHASH_PRECISION_FP32);
     if (chunk == 0)
-        chunk = 128;
+        chunk = statevector ? 128 : nonces;
+
     uint32_t done = 0;
     double total_s = 0;
     while (done < nonces) {
         job.nonce_start = done;
         job.nonce_count = (nonces - done > chunk) ? chunk : (nonces - done);
         share_count = 0;
-        if (qhash_mine_batch(&job, shares.data(), max_shares, &share_count, &seconds) != 0) {
+        if (qhash_mine_batch(&job, &share, 1, &share_count, &seconds) != 0) {
             std::fprintf(stderr, "mine_batch failed\n");
             return 1;
         }
@@ -223,11 +317,14 @@ static int run_benchmark(uint32_t nonces, qhash_precision_t prec, uint32_t nTime
     const double hs = (total_s > 0) ? (double(nonces) / total_s) : 0;
     std::printf("Nonces tested: %u\n", nonces);
     std::printf("Time: %.4f seconds\n", total_s);
-    std::printf("Hashrate: %.2f H/s (%.3f kh/s)\n", hs, hs / 1000.0);
-    std::printf("Backend: %s  precision: %s  chunk: %u  threads: %d  streams: %d\n",
-                qhash_cuda_available() ? "CUDA" : "CPU",
-                prec == QHASH_PRECISION_FP32 ? "FP32" : "FP64", chunk, threads, streams);
-    std::printf("vs Official cuStateVec ~4.5 kh/s (RTX 4070): measure on target GPU\n");
+    std::printf("Hashrate: %.2f H/s (%.3f kh/s, %.3f Mh/s)\n", hs, hs / 1e3, hs / 1e6);
+    std::printf("Backend: %s (%d SMs)  sim: %s  precision: %s  threads: %d  blocks: %d",
+                qhash_cuda_available() ? "CUDA" : "CPU", qhash_cuda_sm_count(),
+                statevector ? "statevector" : "closed-form",
+                prec == QHASH_PRECISION_FP32 ? "FP32" : "FP64", threads, blocks);
+    if (statevector)
+        std::printf("  chunk: %u  streams: %d", chunk, streams);
+    std::printf("\n");
     return 0;
 }
 
@@ -276,8 +373,8 @@ static int run_compare_fp(uint32_t nonces, uint32_t nTime, uint32_t chunk, int t
         qhash::split_nibbles(hash, nibbles);
 
         double e64[QHASH_NUM_QUBITS], e32[QHASH_NUM_QUBITS];
-        qhash_simulate_cpu(nibbles, e64, QHASH_PRECISION_FP64, nTime);
-        qhash_simulate_cpu(nibbles, e32, QHASH_PRECISION_FP32, nTime);
+        qhash_simulate_cpu_sim(nibbles, e64, QHASH_PRECISION_FP64, nTime, QHASH_SIM_STATEVECTOR);
+        qhash_simulate_cpu_sim(nibbles, e32, QHASH_PRECISION_FP32, nTime, QHASH_SIM_STATEVECTOR);
 
         int mm = 0;
         for (int q = 0; q < QHASH_NUM_QUBITS; ++q) {
@@ -313,6 +410,9 @@ static int run_compare_fp(uint32_t nonces, uint32_t nTime, uint32_t chunk, int t
             job.check_target = 0;
             job.threads_per_block = threads;
             job.num_streams = 1;
+            /* Phase 4 asks how FP32 statevector rounding compares to FP64 statevector
+               rounding, so both legs must stay on the statevector kernel. */
+            job.sim = QHASH_SIM_STATEVECTOR;
             std::memset(job.target, 0xFF, 32);
 
             std::vector<qhash_share_t> shares64(n), shares32(n);
@@ -410,18 +510,32 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    uint32_t nonces = 256;
-    uint32_t chunk = 128; /* Phase 3.1 sweep winner on RTX 5060 Laptop */
+    uint32_t nonces = 0; /* 0 → per-simulator default below */
+    uint32_t chunk = 0; /* 0 → per-simulator default in run_benchmark */
     uint32_t q15_nonces = 0; /* 0 → auto min(N,100k) in --compare-fp */
-    int threads = QHASH_DEFAULT_THREADS;
+    int threads = 0; /* 0 → per-simulator default below */
+    int blocks = 0; /* 0 → fill the device */
     int streams = QHASH_DEFAULT_STREAMS;
     qhash_precision_t prec = QHASH_PRECISION_FP64;
+    qhash_sim_t sim = QHASH_DEFAULT_SIM;
     uint32_t nTime = QHASH_SF_ANGLE; /* post-angle softfork default */
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--fp32")
             prec = QHASH_PRECISION_FP32;
+        else if (a == "--sim" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v == "closed" || v == "closed-form" || v == "cf")
+                sim = QHASH_SIM_CLOSED_FORM;
+            else if (v == "statevector" || v == "sv")
+                sim = QHASH_SIM_STATEVECTOR;
+            else {
+                std::fprintf(stderr, "--sim must be closed or statevector\n");
+                return 1;
+            }
+        } else if (a == "--blocks" && i + 1 < argc)
+            blocks = int(std::strtol(argv[++i], nullptr, 10));
         else if (a == "--nonces" && i + 1 < argc)
             nonces = uint32_t(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--q15-nonces" && i + 1 < argc)
@@ -436,8 +550,23 @@ int main(int argc, char** argv)
             nTime = uint32_t(std::strtoul(argv[++i], nullptr, 10));
     }
 
-    if (threads != 128 && threads != 256) {
-        std::fprintf(stderr, "--threads must be 128 or 256\n");
+    const bool statevector_path = (sim == QHASH_SIM_STATEVECTOR) || prec == QHASH_PRECISION_FP32;
+    if (threads == 0)
+        threads = statevector_path ? QHASH_DEFAULT_THREADS : QHASH_CF_DEFAULT_THREADS;
+    if (nonces == 0)
+        nonces = statevector_path ? 256 : (1u << 22);
+
+    if (statevector_path) {
+        if (threads != 128 && threads != 256) {
+            std::fprintf(stderr, "--threads must be 128 or 256 for the statevector kernel\n");
+            return 1;
+        }
+    } else if (threads < 32 || threads > 1024 || (threads % 32) != 0) {
+        std::fprintf(stderr, "--threads must be a multiple of 32 in 32..1024\n");
+        return 1;
+    }
+    if (blocks < 0) {
+        std::fprintf(stderr, "--blocks must be >= 0\n");
         return 1;
     }
     if (streams < 1 || streams > QHASH_MAX_STREAMS) {
@@ -449,10 +578,11 @@ int main(int argc, char** argv)
         return self_test();
 
     if (std::strcmp(argv[1], "--benchmark") == 0)
-        return run_benchmark(nonces, prec, nTime, chunk, threads, streams);
+        return run_benchmark(nonces, prec, nTime, chunk, threads, streams, sim, blocks);
 
     if (std::strcmp(argv[1], "--compare-fp") == 0)
-        return run_compare_fp(nonces, nTime, chunk, threads, q15_nonces);
+        return run_compare_fp(nonces, nTime, chunk == 0 ? 128 : chunk,
+                              (threads == 128 || threads == 256) ? threads : 256, q15_nonces);
 
     if (std::strcmp(argv[1], "--hash-hex") == 0) {
         if (argc < 3) {
