@@ -1,0 +1,15 @@
+build/
+build-*/
+.deps-*/
+*.o
+*.a
+*.so
+.cache/
+phase4_*.log
+bench-*.log
+.pool-wallet-test.txt
+pool-accept*.log
+*.qdstrm
+*.nsys-rep
+*.sqlite
+.DS_Store
