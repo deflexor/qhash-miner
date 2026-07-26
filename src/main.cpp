@@ -9,6 +9,7 @@
 #include "qhash_params.h"
 #include "circuit.cuh"
 #include "sha256.cuh"
+#include "target.cuh"
 
 #include <array>
 #include <cstdio>
@@ -223,8 +224,10 @@ static int self_test()
             job.nonce_start = 0;
             job.nonce_count = kMine;
             job.check_target = 1;
+            /* Little-endian target (Bitcoin/cpuminer layout): byte 31 is the most
+               significant, so this asks for a digest whose top byte is below 0x04. */
             std::memset(job.target, 0xFF, 32);
-            job.target[0] = 0x04;
+            job.target[31] = 0x04;
 
             std::vector<qhash_share_t> shares(kMine);
             uint32_t found = 0;
@@ -247,7 +250,7 @@ static int self_test()
                     std::fprintf(stderr, "FAIL: share %u digest is not the oracle's\n", n);
                     return 1;
                 }
-                if (shares[i].hash[0] > job.target[0]) {
+                if (!qhash_hash_le_target(shares[i].hash, job.target)) {
                     std::fprintf(stderr, "FAIL: share %u does not meet the target\n", n);
                     return 1;
                 }

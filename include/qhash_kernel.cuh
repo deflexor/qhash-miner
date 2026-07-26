@@ -23,7 +23,10 @@ typedef struct {
     uint32_t nTime;                 /* soft-fork clock */
     qhash_precision_t precision;
     uint8_t header[QHASH_INPUT_SIZE]; /* template; nonce at bytes 76..79 overwritten */
-    uint8_t target[QHASH_SHA256_SIZE]; /* big-endian 256-bit target; all-FF = no check */
+    /* Little-endian 256-bit target, i.e. byte 31 most significant — the Bitcoin /
+       cpuminer `work->target` layout, so a plain memcpy from it is correct.
+       All-FF accepts everything, all-00 accepts nothing. See target.cuh. */
+    uint8_t target[QHASH_SHA256_SIZE];
     int check_target;               /* 0 = record every digest (small batches only) */
     int threads_per_block;          /* 0 = default */
     int num_streams;                /* statevector path only: 1..4 chunk streams */

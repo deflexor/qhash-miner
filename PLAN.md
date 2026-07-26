@@ -111,7 +111,7 @@ task, and it was rejected *because* the measured Q1.15 headroom is too small for
 | 6.11 | Re-tune threads/blocks/occupancy from scratch (old tuning is void) | ✅ Done — swept from scratch; **flat within 1%** over threads 128–512 and 1–16 resident waves. Defaults T=256, occupancy-derived grid. Launch *batch size* is the real lever (see 6.11 sweep) |
 | 6.12 | Candidate re-verification vs statevector before submit | ✅ Done — `cf_reverify_candidates`; the submitted digest **is** the oracle's and is re-tested against the target. Self-test: 66 shares, 66 oracle checks, 0 rejected |
 | 6.13 | Retire tile/fiber/dbuf/boundary code paths | ✅ Done — statevector kernel is now plain gate-at-a-time global memory; `QHASH_SMEM_TILE` / `QHASH_BOUNDARY_PAIR` removed; `src/qhash_kernel.cu` −379 lines |
-| 6.14 | If FP64-bound: float-float (double-single) FP32 arithmetic | ❌ **REJECTED** — kernel *is* FP64-bound (96% of measured issue rate), but the Q1.15 safety margin is only **~20×** the current residual. Float-float is ~2^−46 vs FP64's 2^−53, i.e. **~128× worse** — it would produce real divergences. Explicit `fma` was taken instead: same 2× on FP64 issue, and *better* accuracy |
+| 6.14 | If FP64-bound: float-float (double-single) FP32 arithmetic | ⚠️ **REOPENED 2026-07-27** — was rejected because reduced precision breaks bit-exactness (Q1.15 margin ~20×, float-float ~128× worse). **That premise no longer holds:** 6.12 made the oracle, not the mining kernel, decide every submitted digest, so the kernel only has to be a good *filter*. Reduced precision now costs missed winners, not invalid shares. The pool benchmark table says the field is ~3× ahead of us, and our own ablation says a free sweep would be SHA-bound at 1.39 GH/s. See Phase 8 |
 
 ---
 
@@ -127,7 +127,41 @@ Record every meaningful run. Update **Change** vs previous best on same hardware
 | — | Official cuStateVec (this host) | RTX 5060 Laptop | **~0.76–0.78 kh/s** | Stock `qhash-custatevec.c` FP32; measured 2026-07-26 (`official-miner-stock/`, `-t 1`) |
 | — | CPU AVX miner | Ryzen 9 7950X | **~12.6 kh/s** | 30 threads |
 | — | AllFather GPU | RTX 4070 | **~20 kh/s** | Community |
-| — | **Target** | RTX 4070 | **100–200+ kh/s** | Custom kernel |
+| — | **Target** (original, 2026-07-26) | RTX 4070 | **100–200+ kh/s** | Custom kernel — **obsolete, see below** |
+
+### The real competition (Suprnova pool benchmark table, read 2026-07-27)
+
+<https://qtc.suprnova.cc/index.php?page=calculator> publishes per-GPU qhash rates that are **~400 000×**
+the "official ~4.5 kh/s on a 4070" figure this plan was written against. The ecosystem has clearly
+found a fast algorithm too, and the 100–200 kh/s target above is meaningless.
+
+| GPU | CUDA cores | Pool-listed | GH/s per 1000 cores |
+|-----|-----------:|------------:|--------------------:|
+| RTX 5090 | 21760 | 5.31 GH/s | 0.244 |
+| RTX 4090 | 16384 | 4.82 GH/s | 0.294 |
+| RTX 4070 | 5888 | 1.97 GH/s | 0.335 |
+| RTX 4060 | 3072 | 0.89 GH/s | 0.290 |
+| RTX 3060 | 3584 | 0.70 GH/s | 0.195 |
+| RTX 3050 | 2560 | 0.50 GH/s | 0.195 |
+| **This project** | **3072** (5060 Laptop) | **0.292 GH/s** | **0.095** |
+
+The RTX 4060 is the fair comparison: same 3072 cores as our 5060 Laptop, listed at **0.89 GH/s**
+against our **0.292** — we are roughly **3× behind**, and 2–3.5× behind on a per-core basis across the
+whole table. So: far ahead of the *stock* miner (390× on this card, measured), but behind the field.
+
+**Why, and what the headroom is.** We are FP64-issue-bound at 96% of the roofline, and consumer cards
+run FP64 at 1/64 rate. The ablation says the sweep is the whole cost and SHA-256 is nearly free:
+
+| | ns/nonce | equivalent |
+|--|---------:|-----------:|
+| FP64 sweep alone | 3.285 | 0.304 GH/s |
+| SHA-256 alone | 0.717 | **1.389 GH/s** |
+| shipped kernel | 3.311 | 0.302 GH/s |
+
+If the sweep cost went to zero we would be SHA-bound at **1.39 GH/s on this laptop card** — 1.6× the
+listed desktop 4060 and 0.45 GH/s per 1000 cores, better than every row in the table. The listed
+numbers sit *between* our FP64 rate and our SHA ceiling, which is exactly what a reduced-precision
+sweep plus a SHA-bound tail looks like. That is almost certainly what the field is running.
 
 ### This project
 
@@ -161,6 +195,8 @@ Record every meaningful run. Update **Change** vs previous best on same hardware
 | 11c | 2026-07-26 | + cos²/sin²/cos·sin tabulated | RTX 5060 Laptop | FP64 | 268 435 456 | 0.866 | 3.099e8 | **309 680** | **+15%** vs iter 11b | 442 → **379** FP64 instr/nonce; bit-identical change |
 | **12** | 2026-07-26 | **Sustained steady state** (final) | RTX 5060 Laptop | FP64 | 4 000 000 000 | 13.95 | 2.869e8 | **286 934** | −7% vs iter 11c | 954 × 4 M launches; median of 3 (285.5 / 286.9 / 286.5). Below 11c *because* 11c is one warm launch with no per-launch overhead; **12 is the honest continuous-mining number** and 11c is the kernel-only ceiling |
 | **13** | 2026-07-26 | **Official miner CUDA BYOS** (end to end) | RTX 5060 Laptop | FP64 | (live) | ~60s | ~2.98e8 | **~298 000** | **~91 700×** vs iter 10b; **~390×** vs stock cuStateVec same card | `-a qhash --benchmark -t 1`; batch 4 M (was 128 → 735 kh/s) |
+| 13b | 2026-07-27 | Live pool, **before** target fix | RTX 5060 Laptop | FP64 | (live) | ~10m | ~1.48e6 | **~1 480** | **−99.5%** vs iter 13 | Suprnova Diff 0.5. Kernel still 147 Mh/s, but ~100% of nonces passed the broken target filter and 1024 of them per batch got a 4.6 ms statevector re-hash: 0.029 s GPU + ~4.7 s oracle per batch |
+| **14** | 2026-07-27 | **Live pool, after target fix** | RTX 5060 Laptop | FP64 | (live) | ~150s | 2.92e8 | **~292 000** | restored to iter 13 | Suprnova Diff 0.5, `-t 1`. **11 submitted / 11 accepted / 0 rejected / 0 stale**, share diffs 0.67–8.98, 0 candidates per 4 M batch. ⚠️ **Miner-side count. The pool's own page reported 150.92 MH/s — see "Unresolved: pool-side rate" below.** |
 
 ### Phase 3.1 sweep (RTX 5060 Laptop, FP64, 1024 nonces)
 
@@ -357,6 +393,82 @@ sweep reports only a nonce number.
 | Pool (HeroMiners) | Unreachable from this WSL (fake-IP `198.18.0.x` / empty stratum on real IP) |
 | Pool (LuckyPool) | Connects; ignores static `=DIFF`; stuck Diff **48** (~years TTF) |
 | Pool (low-diff proxy→Suprnova) | **11/11** pool hash-OK (`low difficulty share`); ~2.76 kh/s CUDA |
+| **Pool (Suprnova direct, 2026-07-27)** | **11 submitted / 11 accepted / 0 rejected / 0 stale** at Diff 0.5, ~292 Mh/s, share diffs 0.67–8.98 — first *credited* shares |
+
+### Unresolved: pool-side rate is ~half the miner-side rate (2026-07-27)
+
+The miner counts **292 MH/s**; Suprnova's "My Hashrate" showed **150.92 MH/s**. These measure
+different things and the gap is not yet explained.
+
+- Miner-side is a *direct count* of nonces retired. It is corroborated by the standalone benchmark
+  (287 MH/s sustained) and by `qhash-cf-ablation` (302 MH/s warm), so the GPU really is doing the work.
+- Pool-side is *inferred from accepted shares* over a moving window. It cannot be more accurate than
+  the share statistics allow, and our sample is 11 shares.
+
+Arithmetic on the 146 s window (01:41:17 → 01:43:43, 11 accepted shares):
+
+| | value |
+|--|------|
+| hashes counted by the miner | 292e6 × 146 = **4.26e10** |
+| hashes per share at Diff 0.5 (= D · 2³²) | **2.15e9** |
+| shares expected | **19.9** |
+| shares observed | **11** |
+| Poisson significance | ≈ **−2.0 σ**, P(X ≤ 11) ≈ 2.3% |
+
+So the shortfall is real but only ~2 σ — suggestive, not conclusive. Two candidate explanations, both
+still open:
+
+1. **Measurement artifact.** We mined for 2.5 minutes and stopped. If the pool averages over ~10
+   minutes, a partially-filled window reads low; 150.92/292 = 52% is roughly what a 2.5-of-10-minute
+   window would give. Also note `D · 2³²` may be the wrong constant here: cpuminer's own share-TTF
+   line implies 5.27e9 hashes/share, 2.45× larger, and under *that* constant 11 observed vs 8.1
+   expected is **above** target. The block-TTF line does match `netdiff · 2³²` exactly, so the
+   per-share constant needs pinning down before this table means anything.
+2. **Real lost work.** Something between "nonce retired" and "distinct useful nonce searched" is
+   wasting ~half the hashes. Nonce-space exhaustion was the obvious suspect — at 292 MH/s the 32-bit
+   space lasts only **14.7 s** — but it is ruled out: `extranonce2` is subscribed (size 4), and
+   cpu-miner.c only stalls when it is not (`"nonce range exhausted, extranonce not subscribed"`),
+   which never appears in the log.
+
+**Do not quote 292 MH/s as the mining rate until this is settled.** The honest range today is
+150–292 MH/s. Settling it needs a sustained run (≥30 min, hundreds of shares), which shrinks the
+Poisson error to <10% and lets the pool's average converge. That is the top item for next session.
+
+### The target-comparison bug (found 2026-07-27, live at the pool)
+
+Pool mining ran at **1.48 Mh/s** while `--benchmark` ran at 290 Mh/s. The kernel was innocent
+(147 Mh/s in the same run); the difference was that **`--benchmark` uses an unreachable target and
+so never exercises candidate handling**, which is the one path pool mining takes.
+
+`-D` on the wrapper showed it immediately:
+
+```
+qhash cuda: 4194304 nonces in 0.029 s (147.1 Mh/s kernel), 1024 candidates, oracle checks 9782
+```
+
+1024 is `kMaxShares` — the queue was saturating every batch. Root cause: **the target was compared in
+the wrong byte order.** Bitcoin, Qubitcoin's `CheckProofOfWork` (`UintToArith256`) and cpuminer's
+`valid_hash` all read a 256-bit hash **little-endian** — SHA-256 output byte 0 is the *least*
+significant. Our comparison walked both arrays from index 0 as if byte 0 were the *most* significant,
+so it compared the digest's top byte against the target's bottom byte. For a Diff-0.5 target those
+low bytes are `0xFF`, so the filter accepted ~everything. Then Phase 6.12 did exactly what it
+promised and re-hashed 1024 "candidates" per batch through the statevector: 1024 × 4.6 ms ≈ **4.7 s of
+oracle work per 0.029 s of GPU work**, which is the entire 200× shortfall.
+
+This was **pre-existing, not a Phase 6 regression** — Phase 5 shipped the same comparison. It was
+invisible at 3 kh/s because a spurious candidate cost one cheap re-hash and `valid_hash` filtered the
+rest before submission. Phase 6 made it fatal by pairing a 100 000× faster kernel with a per-candidate
+statevector call. It also explains Phase 5.3's "11/11 `low difficulty share`": the miner was
+submitting whatever survived a filter that was not filtering.
+
+Fixed in `include/target.cuh`, one definition shared by host and device, used by the closed-form
+kernel, the statevector kernel, the CPU fallbacks and the 6.12 re-verification. `qhash_job_t::target`
+is now documented as little-endian, which is exactly cpuminer's `work->target` layout, so the BYOS
+wrapper's plain `memcpy` is correct. Result: **0 candidates per 4 M batch, 292 Mh/s, 11/11 accepted.**
+
+Lesson for the speed table: **a benchmark that skips the candidate path cannot certify mining
+throughput.** Iter 13's ~298 Mh/s was real for the kernel and misleading for mining; iter 14 measures
+the path that actually runs.
 
 ### Profile snapshot (Phase 6 closed-form kernel)
 
@@ -377,10 +489,18 @@ issue-rate probe, all in one process so every variant sees the same clocks.
 | **Roofline utilisation** | 379 × 309.7 M = **117.5 G/s = 96% of the measured FP64 issue rate** |
 | Verdict | **FP64-issue-bound at the roofline.** Occupancy, SHA-256 and memory are all irrelevant; the only remaining lever is fewer FP64 instructions per nonce |
 
-Consequence for 6.14: being FP64-bound is the *precondition* for float-float, but the Q1.15 headroom
-is only ~20×, and float-float's 2^−46 accuracy is ~128× worse than FP64's 2^−53. It would convert
-"0 real divergences" into "several per million nonces". Explicit `fma` captured the same 2× while
-*reducing* error, so 6.14 is closed as rejected on measured evidence.
+Consequence for 6.14, as argued on 2026-07-26: being FP64-bound is the *precondition* for
+float-float, but the Q1.15 headroom is only ~20×, and float-float's 2^−46 accuracy is ~128× worse
+than FP64's 2^−53. It would convert "0 real divergences" into "several per million nonces".
+
+**Revised 2026-07-27.** That reasoning silently assumed the mining kernel's digest is the one we
+submit. Since 6.12 it is not — the statevector oracle recomputes every candidate and its digest is
+what goes to the pool. So a reduced-precision sweep cannot produce an invalid share; it can only
+produce a *wrong filter*, i.e. miss nonces whose true digest would have passed. The cost is an
+efficiency loss equal to the fraction of nonces whose reduced-precision digest differs from the true
+one, and that is a throughput trade rather than a correctness one. Given the field is ~3× ahead
+(pool table above) and FP64 is 1/64 rate on consumer silicon, that trade is now worth measuring.
+See Phase 8.
 
 ---
 
@@ -594,24 +714,60 @@ so the pessimistic "1–10% of roofline" assumption was the dominant error.
 
 ## Success criteria
 
+The original table (written against a "~4.5 kh/s official miner" baseline) is met by ~1400×:
+
 | Metric | Min | Target | Stretch | **Measured (RTX 5060 Laptop)** |
 |--------|-----|--------|---------|--------------------------------|
 | kh/s | 50 | 100 | 200 | **286,934** sustained (**1435× stretch**) |
 | vs official | 10× | 22× | 44× | **~390×** vs stock cuStateVec, same card |
 | Bit-exact vs node | 100% | 100% | 100% | **100%** — 0 real divergences / 64 M values; oracle re-verifies every share |
+| Credited pool shares | — | — | — | **11/11 accepted**, 0 rejected, 0 stale (Suprnova Diff 0.5) |
 
-All three criteria met by a wide margin on a *laptop* GPU weaker than the 4070 the table was written
-against.
+But those goalposts were set against a baseline that no longer reflects the field. Measured against
+the Suprnova pool's published per-GPU table, we are **~3× behind a comparable card** (RTX 4060,
+same core count: 0.89 GH/s listed vs our 0.292). Revised bar:
+
+| Metric | Min | Target | Stretch |
+|--------|-----|--------|---------|
+| GH/s per 1000 CUDA cores | 0.29 (match RTX 4060) | 0.335 (match RTX 4070) | 0.45 (our SHA-256 ceiling) |
+| On this card (3072 cores) | 0.89 GH/s | 1.03 GH/s | 1.39 GH/s |
+| Share validity | 100% | 100% | 100% |
+
+Share validity stays at 100% regardless, because 6.12 submits the oracle's digest.
+
+---
+
+## Phase 8 — reduced-precision sweep behind the oracle (proposed)
+
+Reopens 6.14 on a different footing. **The mining kernel is a filter, not an authority** — 6.12
+already guarantees the submitted digest comes from the FP64 statevector. So the only question is how
+much throughput a reduced-precision sweep buys and how many true winners it misses.
+
+| ID | Task |
+|----|------|
+| 8.1 | Measure the *filter miss rate* first, on CPU, no kernel: for N nonces compute the digest with an FP32 sweep and with FP64, and report the fraction that differ. That fraction is the efficiency loss. Do the same for float-float. **Gate: if FP32's miss rate is <10%, FP32 wins outright; if not, float-float is the fallback.** |
+| 8.2 | Note the closed form has ~400 operations where the FP32 statevector study (Phase 4, 92.2% digest match) had ~30 M, so its FP32 error should be far smaller — but that is a prediction, not a measurement. 8.1 settles it. |
+| 8.3 | Port `closed_form_sweep` to the chosen precision as a *template parameter*, keeping the FP64 instantiation as the oracle and the harness's reference. No duplicated algorithm. |
+| 8.4 | Re-tune: the kernel should become SHA-256-bound, so 6.9's midstate/constant-folding work and occupancy suddenly matter again. Target the 1.39 GH/s SHA ceiling measured by `qhash-cf-ablation`. |
+| 8.5 | Re-verify the whole 6.2/6.3 gate against the FP64 oracle, and confirm live at the pool that the accept rate stays 100% while hashrate rises. Any rejected share is a stop-the-line bug. |
+| 8.6 | Only if still short of the field: revisit SHA-256 itself (it becomes the bottleneck), and multi-GPU. |
+
+Guardrail that does not change: **FP64 statevector re-verification stays on the submit path.** The
+speedup is allowed to cost us shares; it is never allowed to cost us validity.
 
 ---
 
 ## Next session — short prompt
 
-Phase 6 is complete and the kernel is at 96% of the card's measured FP64 issue rate, so there is no
-large win left inside this algorithm. The open work is *deployment*, not optimisation:
+Phase 6 is complete, the kernel is at 96% of the card's measured FP64 issue rate, and it earns
+credited pool shares. But the pool's published benchmark table shows the field is ~3× ahead, so the
+work is no longer just deployment:
 
 ```
-qhash-miner Phase 7: earn credited pool shares with the Phase 6 closed-form kernel.
+qhash-miner Phase 8. Two jobs: (0) settle what our real mining rate actually is,
+then (1) close the gap to the field with a reduced-precision sweep behind the FP64
+oracle. Read "Unresolved: pool-side rate", "The real competition" and "Phase 8" in
+PLAN.md before touching code.
 
 REPO / TOOLCHAIN
 - /home/dfr/qbtc/qhash-miner (read-only refs: official-miner/, qubitcoin-node/, cpu-miner/)
@@ -622,34 +778,64 @@ REPO / TOOLCHAIN
     cmake -S . -B build -DQHASH_ENABLE_CUDA=ON -DCMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc
 
 WHERE WE ARE
-- Shipped: FP64 closed-form sweep, 287 Mh/s sustained, ~298 Mh/s through official-miner.
-  ~88,000x the old statevector, ~390x stock cuStateVec on the same card.
+- Shipped: FP64 closed-form sweep. 287 Mh/s standalone benchmark; live at Suprnova the
+  miner counted ~292 Mh/s with 11/11 credited accepts, but the POOL PAGE SAID
+  150.92 Mh/s. That gap is unresolved (~2 sigma on 11 shares) - treat the true rate as
+  150-292 Mh/s and do not quote 292 until item 0 below settles it.
+- Either way this is ~200,000-380,000x the stock cuStateVec miner on this same card
+  (0.76 kh/s measured), so the original "50x vs official" goal is long since met.
 - The kernel is FP64-issue-bound at 96% of the measured roofline (379 FP64 instr/nonce,
-  122.8 G instr/s). Do NOT expect more from micro-optimisation.
-- 6.14 float-float FP32 is REJECTED on measured evidence: Q1.15 headroom is only ~20x
-  and float-float is ~128x less accurate. Phase 4 FP32 also stays REJECTED.
+  120.7 G instr/s). Do NOT expect more from micro-optimisation of the FP64 path.
+- BUT the Suprnova pool publishes per-GPU rates and we are 3-6x behind a comparable card
+  (RTX 4060, same 3072 cores: 0.89 GH/s listed vs our 0.15-0.29). The old "official
+  4.5 kh/s on a 4070" baseline is obsolete; the field found a fast algorithm too.
+- Ablation (qhash-cf-ablation, warm): FP64 sweep 3.285 ns/nonce, SHA-256 0.717 ns/nonce.
+  A free sweep would leave us SHA-bound at 1.39 GH/s on this card, above every row in
+  the pool table. The listed rates sit between our FP64 rate and our SHA ceiling.
 - Self-test digest must stay 8711a7a489f9021a8d8011434e374944ee4051851d21c9fc08dee11757d25bc4
 - Gate convention is FIXED: cuStateVec exp(+i theta P), full angle, NOT theta/2.
+- Target is LITTLE-endian (Bitcoin/cpuminer layout), see include/target.cuh. Getting this
+  backwards cost 200x and was only caught live at the pool.
 - Every share is re-verified through the statevector oracle before submission (6.12),
   and the oracle's digest is the one submitted.
 
 WHAT TO DO
-1. Phase 5.3 left off at 11/11 pool hash-OK but 0 credited (all "low difficulty share").
-   At 287 Mh/s the old ~8-day share TTF at Suprnova Diff 0.5 collapses to well under a
-   second, so re-run the pool tests and get actual credited accepts. Check whether the
-   pool now raises difficulty via vardiff and that the miner honours mining.set_difficulty.
-2. Confirm stability under sustained load: run >=1 h continuous, watch for XID errors,
-   thermal throttle, and any share rejected by the oracle re-verification (should be 0).
-3. Re-check the BYOS batch size against pool responsiveness under real work restarts,
-   not just --benchmark. 4 M nonces is ~15 ms at current speed; verify no stale shares.
-4. Only then consider multi-GPU / multi-device dispatch.
+0. SETTLE THE RATE FIRST - it decides how big the gap actually is (3x or 6x).
+   a. Pin down hashes-per-share for qhash. Block TTF matches netdiff * 2^32 exactly,
+      but cpuminer's share TTF implies 2.45x more hashes per share than
+      stratum_diff * 2^32. Find the constant in the qhash gate / work_set_target
+      (opt_target_factor?) so share counts can be converted to a hashrate at all.
+   b. Run >=30 min live (hundreds of shares) and compare three numbers: the miner's
+      counted rate, shares * hashes_per_share / elapsed, and the pool page. With
+      ~300 shares the Poisson error is <6%, so the three must agree or something
+      is wrong. ASK THE USER before running live against their wallet.
+   c. If shares come up short, instrument for lost/duplicated work: log the actual
+      nonce ranges scanned per job and check for overlap after extranonce2 rolls.
+      At 292 MH/s the 32-bit nonce space lasts 14.7 s, so extranonce2 rolls
+      constantly and any overlap bug is amplified enormously.
+1. 8.1 THEN, ON CPU, NO KERNEL. Measure the filter miss rate: fraction of nonces whose
+   FP32-sweep digest differs from the FP64 one. That fraction IS the efficiency loss,
+   because 6.12 means a wrong filter costs a missed winner, never an invalid share.
+   Do float-float too. If FP32 misses <10%, take FP32; else fall back to float-float.
+   Phase 4's 92.2% FP32 figure was for the 30M-op statevector, not this ~400-op sweep,
+   so do not assume it carries over in either direction - measure it.
+2. 8.3 Template closed_form_sweep on the scalar type. Keep FP64 as the oracle and as the
+   harness reference; do not fork the algorithm.
+3. 8.4 Re-tune for a SHA-256-bound kernel and chase the 1.39 GH/s ceiling.
+4. 8.5 Re-run the full 6.2/6.3 gate against the FP64 oracle, then confirm live at the
+   pool that accept rate stays 100% as hashrate rises. A rejected share stops the line.
+5. Still open from Phase 7: sustained >=1 h run, accept rate over hundreds of shares
+   (not eleven), vardiff behaviour, and stale-share checks across many job changes.
 
 GUARDRAILS
-- Correctness > hashrate. FP32 stays OFF. Statevector stays as the oracle.
+- The FP64 statevector re-verification stays on the submit path, always. The speedup may
+  cost shares; it may never cost validity.
 - Do not change the gate convention or the Q1.15 rounding, including the int16 wrap.
 - Do not break the BYOS ABI in src/byos/qhash_byos.cpp.
 - Measure on the real GPU with a multi-second sustained load; short runs read low
   because the GPU has not boosted (a cold 4 M launch reads ~26 Mh/s vs 287 sustained).
+- --benchmark uses an unreachable target and does NOT exercise the candidate path.
+  Never certify mining throughput with it; measure live or with a realistic target.
 ```
 
 <details>

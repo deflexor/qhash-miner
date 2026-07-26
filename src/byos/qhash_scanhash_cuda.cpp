@@ -116,6 +116,16 @@ extern "C" int scanhash_qhash_cuda(struct work *work, uint32_t max_nonce, uint64
             break;
         }
 
+        if (opt_debug) {
+            uint64_t checked = 0, rejected = 0;
+            qhash_cuda_reverify_stats(&checked, &rejected);
+            applog(LOG_DEBUG,
+                   "qhash cuda: %u nonces in %.3f s (%.1f Mh/s kernel), %u candidates, "
+                   "oracle checks %llu rejected %llu",
+                   count, secs, secs > 0 ? double(count) / secs / 1e6 : 0.0, share_count,
+                   (unsigned long long)checked, (unsigned long long)rejected);
+        }
+
         if (!bench && share_count > 0) {
             /* Digests here have already been re-derived by the statevector oracle
                inside qhash_mine_batch (Phase 6.12), so this is the ordinary

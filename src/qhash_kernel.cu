@@ -18,6 +18,7 @@
 #include "closed_form.cuh"
 #include "sha256.cuh"
 #include "sha256_mine.cuh"
+#include "target.cuh"
 #include "qhash_cpu.h"
 
 #include <atomic>
@@ -239,17 +240,7 @@ __device__ void d_expectations(const Complex<Real>* psi, Real* exp_out, int tid,
 
 __device__ int d_hash_le_target(const uint8_t hash[32], const uint8_t target[32])
 {
-    /* Compare as little-endian 256-bit integers (Bitcoin style: hash[::-1] < target).
-       Mining typically compares byte-reversed; here we do raw memcmp big-endian of
-       the SHA256 digest as produced (big-endian words). Match cpuminer: treat as
-       32-byte BE number. */
-    for (int i = 0; i < 32; ++i) {
-        if (hash[i] < target[i])
-            return 1;
-        if (hash[i] > target[i])
-            return 0;
-    }
-    return 1;
+    return qhash_hash_le_target(hash, target);
 }
 
 template <typename Real>
@@ -374,17 +365,9 @@ __device__ __forceinline__ uint32_t cf_bswap32(uint32_t x)
            ((x & 0xFF000000u) >> 24);
 }
 
-/** Big-endian 256-bit compare; equality counts as a hit, as in the byte loop. */
 __device__ __forceinline__ bool cf_le_target(const uint32_t h[8], const uint32_t t[8])
 {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        if (h[i] < t[i])
-            return true;
-        if (h[i] > t[i])
-            return false;
-    }
-    return true;
+    return qhash_digest_le_target(h, t);
 }
 
 __global__ void qhash_cf_kernel(uint32_t nonce_start, uint32_t nonce_count, qhash_share_t* shares,
@@ -575,16 +558,7 @@ uint32_t cf_reverify_candidates(const qhash_job_t* job, qhash_share_t* shares, u
                            QHASH_SIM_STATEVECTOR);
         ++g_reverify_checked;
 
-        bool meets = true;
-        for (int b = 0; b < QHASH_SHA256_SIZE; ++b) {
-            if (ref[b] < job->target[b])
-                break;
-            if (ref[b] > job->target[b]) {
-                meets = false;
-                break;
-            }
-        }
-        if (!meets) {
+        if (!qhash_hash_le_target(ref, job->target)) {
             ++g_reverify_rejected;
             continue;
         }
@@ -618,8 +592,11 @@ static int mine_batch_closed_form(const qhash_job_t* job, qhash_share_t* shares_
     p.hdr_w[1] = sha256_load_be(job->header + 68);
     p.hdr_w[2] = sha256_load_be(job->header + 72);
     sha256_pad_schedule(p.pad_w, QHASH_SHA256_SIZE + QHASH_NUM_QUBITS * sizeof(int16_t));
+    /* Little-endian limbs, matching qhash_digest_le_target and cpuminer's layout. */
     for (int i = 0; i < 8; ++i)
-        p.target[i] = sha256_load_be(job->target + 4 * i);
+        p.target[i] = uint32_t(job->target[4 * i]) | (uint32_t(job->target[4 * i + 1]) << 8) |
+                      (uint32_t(job->target[4 * i + 2]) << 16) |
+                      (uint32_t(job->target[4 * i + 3]) << 24);
     p.lut = host_angle_lut(angle_offset(job->nTime));
     p.nTime = job->nTime;
     p.check_target = job->check_target;
@@ -824,20 +801,7 @@ extern "C" int qhash_mine_batch(const qhash_job_t* job, qhash_share_t* shares_ou
             header[79] = uint8_t(nonce >> 24);
             uint8_t hash[32];
             qhash_hash_cpu(header, hash, job->precision, job->nTime);
-            int ok = 1;
-            if (job->check_target) {
-                ok = 1;
-                for (int b = 0; b < 32; ++b) {
-                    if (hash[b] < job->target[b]) {
-                        ok = 1;
-                        break;
-                    }
-                    if (hash[b] > job->target[b]) {
-                        ok = 0;
-                        break;
-                    }
-                }
-            }
+            const int ok = job->check_target ? qhash_hash_le_target(hash, job->target) : 1;
             if (ok && found < max_shares) {
                 shares_out[found].nonce = nonce;
                 std::memcpy(shares_out[found].hash, hash, 32);
@@ -899,17 +863,7 @@ extern "C" int qhash_mine_batch(const qhash_job_t* job, qhash_share_t* shares_ou
         header[79] = uint8_t(nonce >> 24);
         uint8_t hash[32];
         qhash_hash_cpu(header, hash, job->precision, job->nTime);
-        int ok = 1;
-        if (job->check_target) {
-            for (int b = 0; b < 32; ++b) {
-                if (hash[b] < job->target[b])
-                    break;
-                if (hash[b] > job->target[b]) {
-                    ok = 0;
-                    break;
-                }
-            }
-        }
+        const int ok = job->check_target ? qhash_hash_le_target(hash, job->target) : 1;
         if (ok && found < max_shares) {
             shares_out[found].nonce = nonce;
             std::memcpy(shares_out[found].hash, hash, 32);
